@@ -76,6 +76,7 @@ def refine(strategy_name: str, csv_path: str) -> None:
     config = {
         'starting_balance': cfg['backtest-data']['starting_balance'],
         'fee': cfg['backtest-data']['fee'],
+        'type': cfg['backtest-data']['type'],
         'futures_leverage': cfg['backtest-data']['futures_leverage'],
         'futures_leverage_mode': cfg['backtest-data']['futures_leverage_mode'],
         'exchange': cfg['backtest-data']['exchange'],
@@ -156,6 +157,7 @@ def bulk(strategy_name: str) -> None:
     config = {
         'starting_balance': cfg['backtest-data']['starting_balance'],
         'fee': cfg['backtest-data']['fee'],
+        'type': cfg['backtest-data']['type'],
         'futures_leverage': cfg['backtest-data']['futures_leverage'],
         'futures_leverage_mode': cfg['backtest-data']['futures_leverage_mode'],
         'exchange': cfg['backtest-data']['exchange'],
