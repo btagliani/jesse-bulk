@@ -28,7 +28,7 @@ This could be improved.
 
 ```sh
 # install from git
-pip install git+https://github.com/cryptocoinserver/jesse-bulk.git
+pip install git+https://github.com/btagliani/jesse-bulk.git
 
 # cd in your Jesse project directory
 
