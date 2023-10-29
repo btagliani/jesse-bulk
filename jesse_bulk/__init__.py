@@ -13,7 +13,8 @@ import numpy as np
 import pandas as pd
 import pkg_resources
 import yaml
-from jesse.research import backtest, get_candles
+from jesse.research import get_candles
+from jesse.research.backtest import backtest_with_dates
 
 
 def start_logger_if_necessary():
@@ -76,6 +77,7 @@ def refine(strategy_name: str, csv_path: str) -> None:
     config = {
         'starting_balance': cfg['backtest-data']['starting_balance'],
         'fee': cfg['backtest-data']['fee'],
+        'type': cfg['backtest-data']['type'],
         'futures_leverage': cfg['backtest-data']['futures_leverage'],
         'futures_leverage_mode': cfg['backtest-data']['futures_leverage_mode'],
         'exchange': cfg['backtest-data']['exchange'],
@@ -128,12 +130,12 @@ def refine(strategy_name: str, csv_path: str) -> None:
 
                 for dna in dna_df['dna']:
                     key = f'{symbol}-{timeframe}-{timespan["start_date"]}-{timespan["finish_date"]}-{dna}'
-                    mp_args.append((key, config, route, extra_routes, candles, hp_dict, dna))
+                    mp_args.append((key, config, route, extra_routes, timespan['start_date'], timespan['finish_date'], hp_dict, dna))
 
     n_jobs = joblib.cpu_count() if cfg['n_jobs'] == -1 else cfg['n_jobs']
 
     print('Starting bulk backtest.')
-    parallel = joblib.Parallel(n_jobs, verbose=10, max_nbytes=None)
+    parallel = joblib.Parallel(1, verbose=10, max_nbytes=None)
     results = parallel(
         joblib.delayed(backtest_with_info_key)(*args)
         for args in mp_args
@@ -156,6 +158,7 @@ def bulk(strategy_name: str) -> None:
     config = {
         'starting_balance': cfg['backtest-data']['starting_balance'],
         'fee': cfg['backtest-data']['fee'],
+        'type': cfg['backtest-data']['type'],
         'futures_leverage': cfg['backtest-data']['futures_leverage'],
         'futures_leverage_mode': cfg['backtest-data']['futures_leverage_mode'],
         'exchange': cfg['backtest-data']['exchange'],
@@ -208,12 +211,12 @@ def bulk(strategy_name: str) -> None:
 
                 key = f'{symbol}-{timeframe}-{timespan["start_date"]}-{timespan["finish_date"]}'
 
-                mp_args.append((key, config, route, extra_routes, candles, None, None))
+                mp_args.append((key, config, route, extra_routes, timespan['start_date'], timespan['finish_date'], None, None))
 
     n_jobs = joblib.cpu_count() if cfg['n_jobs'] == -1 else cfg['n_jobs']
 
     print('Starting bulk backtest.')
-    parallel = joblib.Parallel(n_jobs, verbose=10, max_nbytes=None)
+    parallel = joblib.Parallel(1, verbose=10, max_nbytes=None)
     results = parallel(
         joblib.delayed(backtest_with_info_key)(*args)
         for args in mp_args
@@ -256,13 +259,13 @@ def get_candles_with_cache(exchange: str, symbol: str, start_date: str, finish_d
     return candles
 
 
-def backtest_with_info_key(key, config, route, extra_routes, candles, hp_dict, dna):
+def backtest_with_info_key(key, config, route, extra_routes, start_date, end_date, hp_dict, dna):
     hp = jh.dna_to_hp(hp_dict, dna) if dna else None
 
     got_exception = False
 
     try:
-        backtest_data = backtest(config, route, extra_routes, candles, hyperparameters = hp)['metrics']
+        backtest_data = backtest_with_dates(config, route, extra_routes, start_date, end_date, hyperparameters = hp)['metrics']
     except Exception as e:
         logger = start_logger_if_necessary()
         logger.error("".join(traceback.TracebackException.from_exception(e).format()), extra={'key': key})
