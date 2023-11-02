@@ -3,8 +3,12 @@ import logging
 import os
 import pathlib
 import pickle
+import random
 import shutil
 import traceback
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Tuple
 
 import click
 import jesse.helpers as jh
@@ -135,7 +139,7 @@ def refine(strategy_name: str, csv_path: str) -> None:
     n_jobs = joblib.cpu_count() if cfg['n_jobs'] == -1 else cfg['n_jobs']
 
     print('Starting bulk backtest.')
-    parallel = joblib.Parallel(1, verbose=10, max_nbytes=None)
+    parallel = joblib.Parallel(n_jobs, verbose=10, max_nbytes=None)
     results = parallel(
         joblib.delayed(backtest_with_info_key)(*args)
         for args in mp_args
@@ -216,7 +220,7 @@ def bulk(strategy_name: str) -> None:
     n_jobs = joblib.cpu_count() if cfg['n_jobs'] == -1 else cfg['n_jobs']
 
     print('Starting bulk backtest.')
-    parallel = joblib.Parallel(1, verbose=10, max_nbytes=None)
+    parallel = joblib.Parallel(n_jobs, verbose=10, max_nbytes=None)
     results = parallel(
         joblib.delayed(backtest_with_info_key)(*args)
         for args in mp_args
@@ -224,10 +228,107 @@ def bulk(strategy_name: str) -> None:
 
     results_df = pd.DataFrame.from_dict(results, orient='columns')
 
-    dt = datetime.datetime.now().strftime("%Y-%m-%d %H-%M-%S.%f")
+    dt = datetime.now().strftime("%Y-%m-%d %H-%M-%S.%f")
 
     results_df.to_csv(f'{strategy_name}_bulk_{dt}.csv', header=True, index=False, encoding='utf-8', sep='\t')
 
+@cli.command()
+@click.argument('csv_path', required=True, type=str)
+def refine_best(csv_path: str) -> None:
+    validate_cwd()
+
+    cfg = get_config()
+    strategy_name = cfg['backtest-data']['strategy_name']
+    dna_df = pd.read_csv(csv_path, header=None, sep=';')[0].to_frame(name='dna')
+
+    StrategyClass = jh.get_strategy_class(strategy_name)
+    hp_dict = StrategyClass().hyperparameters()
+
+    print(dna_df)  # Now this should print the correct DNA values
+
+    all_results = []
+    for _ in range(10):  # Run 10 backtests for each DNA
+        config, mp_args = prepare_backtest_config_and_args(strategy_name, cfg, hp_dict, dna_df['dna'].tolist())
+        results = run_parallel_backtest(mp_args, cfg)
+        all_results.extend(results)
+
+    # Convert all results to a DataFrame
+    results_df = pd.DataFrame.from_dict(all_results, orient='columns')
+
+    # Add a column for the DNA based on the 'key' column
+    results_df['dna'] = results_df['key'].apply(lambda x: x.split('-')[-1])
+
+    # Group by DNA and calculate the average for each group
+    average_results = results_df.groupby('dna').mean()
+
+    # Sort the groups based on the average of the selected metric
+    sorted_results = average_results.sort_values(by='finishing_balance', ascending=False)
+
+    # Save the results to a CSV file
+    dt = datetime.now().strftime("%Y-%m-%d %H-%M-%S.%f")
+    sorted_results.to_csv(f'{strategy_name}_refined_best_average_{dt}.csv', encoding='utf-8', sep='\t')
+
+    # Print the best performing DNA
+    best_dna = sorted_results.iloc[0]
+    print(f"The best performing DNA is: {best_dna.name} with an average finishing balance of {best_dna['finishing_balance']:.2f}%")
+
+def prepare_backtest_config_and_args(strategy_name: str, cfg: Dict, hp_dict: Dict, dnas: List[str]) -> Tuple[Dict, List[Tuple]]:
+    config = {
+        'starting_balance': cfg['backtest-data']['starting_balance'],
+        'fee': cfg['backtest-data']['fee'],
+        'type': cfg['backtest-data']['type'],
+        'futures_leverage': cfg['backtest-data']['futures_leverage'],
+        'futures_leverage_mode': cfg['backtest-data']['futures_leverage_mode'],
+        'exchange': cfg['backtest-data']['exchange'],
+        'settlement_currency': cfg['backtest-data']['settlement_currency'],
+        'warm_up_candles': cfg['backtest-data']['warm_up_candles']
+    }
+
+    validate_backtest_data_config(cfg)
+
+    warm_up_days = cfg['backtest-data']['warm_up_candles']  # Assuming warm-up is defined in candles (days)
+    end_date = cfg['backtest-data']['end_date']
+    mp_args = []
+    for dna in dnas:
+        start_date = get_random_dates_within_timespan(end_date, warm_up_days)
+        for symbol in cfg['backtest-data']['symbols']:
+            for timeframe in cfg['backtest-data']['timeframes']:
+                route = [{'exchange': cfg['backtest-data']['exchange'], 'strategy': strategy_name, 'symbol': symbol, 'timeframe': timeframe}]
+                key = f'{symbol}-{timeframe}-{start_date}-{end_date}-{dna}'
+                extra_routes = []  # Assume you have a way to set extra_routes
+                mp_args.append((key, config, route, extra_routes, start_date, end_date, hp_dict, dna))
+    return config, mp_args
+
+def get_random_dates_within_timespan(end_date: str, warm_up_days: int) -> str:
+    end_date = datetime.strptime(end_date, '%Y-%m-%d')
+
+    # Ensure there are enough days in the year for both the warm-up period and the backtest
+    latest_start_day = end_date - timedelta(days=max(warm_up_days, 1) + 1)  # Ensure at least one day for backtesting
+
+    # Generate a random start date
+    start_date = latest_start_day - timedelta(days=random.randint(60, (latest_start_day - datetime(latest_start_day.year, 1, 1)).days))
+
+    # Deduct the warm-up period
+    start_date -= timedelta(days=warm_up_days)
+
+    # Format dates to string in 'YYYY-MM-DD' format
+    start_date_str = start_date.strftime('%Y-%m-%d')
+
+    return start_date_str
+
+def run_parallel_backtest(mp_args: List[Tuple], cfg: Dict) -> List[Dict]:
+    n_jobs = joblib.cpu_count() if cfg['n_jobs'] == -1 else cfg['n_jobs']
+    parallel = joblib.Parallel(n_jobs, verbose=10, max_nbytes=None)
+    results = parallel(joblib.delayed(backtest_with_info_key)(*args) for args in mp_args)
+    return results
+
+def validate_backtest_data_config(cfg: Dict) -> None:
+    if len(cfg['backtest-data']['symbols']) == 0:
+        raise ValueError("You need to define a symbol. Check your config.")
+    if len(cfg['backtest-data']['timeframes']) == 0:
+        raise ValueError("You need to define a timeframe. Check your config.")
+    if len(cfg['backtest-data']['timespans']) == 0:
+        raise ValueError("You need to define a timespan. Check your config.")
 
 def validate_cwd() -> None:
     """
