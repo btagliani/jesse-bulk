@@ -6,9 +6,10 @@ import pickle
 import random
 import shutil
 import traceback
-from typing import Dict, List, Tuple
-from pathlib import Path
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Tuple
+
 import click
 import jesse.helpers as jh
 import joblib
@@ -400,7 +401,7 @@ def get_random_dates_within_timespan(end_date: str, warm_up_days: int) -> str:
     )  # Ensure at least one day for backtesting
 
     # Calculate the earliest possible start date, 150 days before the end date
-    earliest_start_day = end_date - timedelta(days=150)
+    earliest_start_day = end_date - timedelta(days=120)
 
     # Generate a random start date between earliest_start_day and latest_start_day
     total_days = (latest_start_day - earliest_start_day).days
@@ -409,7 +410,7 @@ def get_random_dates_within_timespan(end_date: str, warm_up_days: int) -> str:
 
     # Format dates to string in 'YYYY-MM-DD' format
     start_date_str = start_date.strftime("%Y-%m-%d")
-
+    print(f"Start date: {start_date_str}")
     return start_date_str
 
 
