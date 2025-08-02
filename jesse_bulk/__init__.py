@@ -299,16 +299,14 @@ def refine_best(db_path: str, top_n: int, runs_per_dna: int) -> None:
     
     # Get top N DNAs based on the sort criteria from config
     sort_criteria = cfg.get('sort_by', 'training_log.net_profit_percentage')
-    if 'training_log.' in sort_criteria:
-        sort_column = sort_criteria.replace('training_log.', '')
+    
+    # Sort and get top N (use full column name as specified in config)
+    if sort_criteria in dna_df.columns:
+        top_dnas = dna_df.nlargest(top_n, sort_criteria)
+        print(f"Sorted by: {sort_criteria}")
     else:
-        sort_column = sort_criteria
-        
-    # Sort and get top N
-    if sort_column in dna_df.columns:
-        top_dnas = dna_df.nlargest(top_n, sort_column)
-    else:
-        print(f"Warning: Sort column '{sort_column}' not found, using first {top_n} DNAs")
+        print(f"Warning: Sort column '{sort_criteria}' not found in database.")
+        print(f"Available columns include: {[col for col in dna_df.columns if 'net_profit_percentage' in col]}")
         top_dnas = dna_df.head(top_n)
     
     print(f"Selected top {len(top_dnas)} DNAs for refinement")
