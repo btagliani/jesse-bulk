@@ -1,3 +1,7 @@
+import warnings
+# Suppress pkg_resources deprecation warnings from Jesse (must be before Jesse imports)
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated", category=UserWarning)
+
 import datetime
 import logging
 import os
