@@ -212,23 +212,10 @@ def bulk(strategy_name: str) -> None:
         for timeframe in cfg["backtest-data"]["timeframes"]:
             for timespan in cfg["backtest-data"]["timespans"].items():
                 timespan = timespan[1]
-                candles = {}
                 extra_routes = []
                 if len(cfg["backtest-data"]["extra_routes"]) != 0:
                     for extra_route in cfg["backtest-data"]["extra_routes"].items():
                         extra_route = extra_route[1]
-                        candles[
-                            jh.key(extra_route["exchange"], extra_route["symbol"])
-                        ] = {
-                            "exchange": extra_route["exchange"],
-                            "symbol": extra_route["symbol"],
-                            "candles": get_candles_with_cache(
-                                extra_route["exchange"],
-                                extra_route["symbol"],
-                                timespan["start_date"],
-                                timespan["finish_date"],
-                            ),
-                        }
                         extra_routes.append(
                             {
                                 "exchange": extra_route["exchange"],
@@ -236,16 +223,6 @@ def bulk(strategy_name: str) -> None:
                                 "timeframe": extra_route["timeframe"],
                             }
                         )
-                candles[jh.key(cfg["backtest-data"]["exchange"], symbol)] = {
-                    "exchange": cfg["backtest-data"]["exchange"],
-                    "symbol": symbol,
-                    "candles": get_candles_with_cache(
-                        cfg["backtest-data"]["exchange"],
-                        symbol,
-                        timespan["start_date"],
-                        timespan["finish_date"],
-                    ),
-                }
 
                 route = [
                     {
@@ -266,8 +243,8 @@ def bulk(strategy_name: str) -> None:
                         extra_routes,
                         timespan["start_date"],
                         timespan["finish_date"],
-                        None,
-                        None,
+                        None,  # hp_dict - not used for bulk
+                        None,  # dna - not used for bulk
                     )
                 )
 
@@ -293,26 +270,109 @@ def bulk(strategy_name: str) -> None:
 
 
 @cli.command()
-@click.argument("csv_path", required=True, type=str)
-def refine_best(csv_path: str) -> None:
+@click.argument("db_path", required=True, type=str)
+@click.option("--top-n", default=10, help="Number of top DNAs to test (default: 10)")
+@click.option("--runs-per-dna", default=10, help="Number of runs per DNA (default: 10)")
+def refine_best(db_path: str, top_n: int, runs_per_dna: int) -> None:
+    from .optuna_reader import read_optuna_study, find_optuna_databases
+    
     validate_cwd()
-
     cfg = get_config()
     strategy_name = cfg["backtest-data"]["strategy_name"]
-    dna_df = pd.read_csv(csv_path, header=None, sep=";")[0].to_frame(name="dna")
+
+    # Load data from Optuna database
+    if not db_path.endswith('.db'):
+        # Try to auto-detect Optuna database in project
+        db_paths = find_optuna_databases()
+        if db_paths:
+            print(f"Found Optuna database: {db_paths[0]}")
+            db_path = db_paths[0]
+        else:
+            raise ValueError("No Optuna database found. Please provide path to .db file")
+    
+    study_name = cfg.get('optuna_study_name', None)
+    dna_df = read_optuna_study(db_path, study_name)
+    
+    # Get top N DNAs based on the sort criteria from config
+    sort_criteria = cfg.get('sort_by', 'training_log.net_profit_percentage')
+    if 'training_log.' in sort_criteria:
+        sort_column = sort_criteria.replace('training_log.', '')
+    else:
+        sort_column = sort_criteria
+        
+    # Sort and get top N
+    if sort_column in dna_df.columns:
+        top_dnas = dna_df.nlargest(top_n, sort_column)
+    else:
+        print(f"Warning: Sort column '{sort_column}' not found, using first {top_n} DNAs")
+        top_dnas = dna_df.head(top_n)
+    
+    print(f"Selected top {len(top_dnas)} DNAs for refinement")
 
     StrategyClass = jh.get_strategy_class(strategy_name)
     hp_dict = StrategyClass().hyperparameters()
 
-    print(dna_df)  # Now this should print the correct DNA values
+    # Prepare config (same as refine command)
+    config = {
+        "starting_balance": cfg["backtest-data"]["starting_balance"],
+        "fee": cfg["backtest-data"]["fee"],
+        "type": cfg["backtest-data"]["type"],
+        "futures_leverage": cfg["backtest-data"]["futures_leverage"],
+        "futures_leverage_mode": cfg["backtest-data"]["futures_leverage_mode"],
+        "exchange": cfg["backtest-data"]["exchange"],
+        "settlement_currency": cfg["backtest-data"]["settlement_currency"],
+        "warm_up_candles": cfg["backtest-data"]["warm_up_candles"],
+    }
 
-    all_results = []
-    for _ in range(10):  # Run 10 backtests for each DNA
-        config, mp_args = prepare_backtest_config_and_args(
-            strategy_name, cfg, hp_dict, dna_df["dna"].tolist()
-        )
-        results = run_parallel_backtest(mp_args, cfg)
-        all_results.extend(results)
+    # Prepare arguments for multiple runs (using same logic as refine but with random dates)
+    mp_args = []
+    for _ in range(runs_per_dna):  # Multiple random time periods
+        for symbol in cfg["backtest-data"]["symbols"]:
+            for timeframe in cfg["backtest-data"]["timeframes"]:
+                # Generate random dates for this run
+                warm_up_days = cfg["backtest-data"]["warm_up_candles"]
+                end_date = cfg["backtest-data"].get("end_date", "2025-07-30")
+                start_date = get_random_dates_within_timespan(end_date, warm_up_days)
+                
+                # Prepare extra routes
+                extra_routes = []
+                if len(cfg["backtest-data"]["extra_routes"]) != 0:
+                    for extra_route in cfg["backtest-data"]["extra_routes"].items():
+                        extra_route = extra_route[1]
+                        extra_routes.append({
+                            "exchange": extra_route["exchange"],
+                            "symbol": extra_route["symbol"],
+                            "timeframe": extra_route["timeframe"],
+                        })
+
+                route = [{
+                    "exchange": cfg["backtest-data"]["exchange"],
+                    "strategy": strategy_name,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                }]
+
+                # Add one backtest for each DNA
+                for dna in top_dnas["dna"]:
+                    key = f'{symbol}-{timeframe}-{start_date}-{end_date}-{dna}'
+                    mp_args.append((
+                        key,
+                        config,
+                        route,
+                        extra_routes,
+                        start_date,
+                        end_date,
+                        hp_dict,
+                        dna,
+                    ))
+
+    # Run all backtests in parallel
+    n_jobs = joblib.cpu_count() if cfg["n_jobs"] == -1 else cfg["n_jobs"]
+    print(f"Starting {len(mp_args)} backtests for top {len(top_dnas)} DNAs...")
+    parallel = joblib.Parallel(n_jobs, verbose=10, max_nbytes=None)
+    all_results = parallel(
+        joblib.delayed(backtest_with_info_key)(*args) for args in mp_args
+    )
 
     # Convert all results to a DataFrame
     results_df = pd.DataFrame.from_dict(all_results, orient="columns")
@@ -320,8 +380,8 @@ def refine_best(csv_path: str) -> None:
     # Add a column for the DNA based on the 'key' column
     results_df["dna"] = results_df["key"].apply(lambda x: x.split("-")[-1])
 
-    # Group by DNA and calculate the average for each group
-    average_results = results_df.groupby("dna").mean()
+    # Group by DNA and calculate the average for each group (only numeric columns)
+    average_results = results_df.groupby("dna").mean(numeric_only=True)
 
     # Sort the groups based on the average of the selected metric
     sorted_results = average_results.sort_values(
@@ -341,85 +401,30 @@ def refine_best(csv_path: str) -> None:
     )
 
 
-def prepare_backtest_config_and_args(
-    strategy_name: str, cfg: Dict, hp_dict: Dict, dnas: List[str]
-) -> Tuple[Dict, List[Tuple]]:
-    config = {
-        "starting_balance": cfg["backtest-data"]["starting_balance"],
-        "fee": cfg["backtest-data"]["fee"],
-        "type": cfg["backtest-data"]["type"],
-        "futures_leverage": cfg["backtest-data"]["futures_leverage"],
-        "futures_leverage_mode": cfg["backtest-data"]["futures_leverage_mode"],
-        "exchange": cfg["backtest-data"]["exchange"],
-        "settlement_currency": cfg["backtest-data"]["settlement_currency"],
-        "warm_up_candles": cfg["backtest-data"]["warm_up_candles"],
-    }
-
-    validate_backtest_data_config(cfg)
-
-    warm_up_days = cfg["backtest-data"][
-        "warm_up_candles"
-    ]  # Assuming warm-up is defined in candles (days)
-    end_date = cfg["backtest-data"]["end_date"]
-    mp_args = []
-    for dna in dnas:
-        start_date = get_random_dates_within_timespan(end_date, warm_up_days)
-        for symbol in cfg["backtest-data"]["symbols"]:
-            for timeframe in cfg["backtest-data"]["timeframes"]:
-                route = [
-                    {
-                        "exchange": cfg["backtest-data"]["exchange"],
-                        "strategy": strategy_name,
-                        "symbol": symbol,
-                        "timeframe": timeframe,
-                    }
-                ]
-                key = f"{symbol}-{timeframe}-{start_date}-{end_date}-{dna}"
-                extra_routes = []  # Assume you have a way to set extra_routes
-                mp_args.append(
-                    (
-                        key,
-                        config,
-                        route,
-                        extra_routes,
-                        start_date,
-                        end_date,
-                        hp_dict,
-                        dna,
-                    )
-                )
-    return config, mp_args
-
-
 def get_random_dates_within_timespan(end_date: str, warm_up_days: int) -> str:
     end_date = datetime.strptime(end_date, "%Y-%m-%d")
 
-    # Ensure there are enough days in the year for both the warm-up period and the backtest
-    latest_start_day = end_date - timedelta(
-        days=warm_up_days + 1
-    )  # Ensure at least one day for backtesting
+    # Calculate the latest possible start date (must leave room for warmup + at least 30 days of backtesting)
+    latest_start_day = end_date - timedelta(days=30)  # 30 days of backtesting minimum
+    
+    # Calculate the earliest possible start date (go back further for more variety)
+    max_lookback = max(120, warm_up_days + 60)  # At least 120 days back, or warmup + 60 days
+    earliest_start_day = end_date - timedelta(days=max_lookback)
 
-    # Calculate the earliest possible start date, 150 days before the end date
-    earliest_start_day = end_date - timedelta(days=120)
-
-    # Generate a random start date between earliest_start_day and latest_start_day
-    total_days = (latest_start_day - earliest_start_day).days
-    random_days = random.randint(0, total_days)
-    start_date = earliest_start_day + timedelta(days=random_days)
+    # Ensure we have a valid range
+    if latest_start_day <= earliest_start_day:
+        # If range is invalid, just use a simple approach
+        start_date = end_date - timedelta(days=60)  # Go back 60 days
+    else:
+        # Generate a random start date between earliest_start_day and latest_start_day
+        total_days = (latest_start_day - earliest_start_day).days
+        random_days = random.randint(0, total_days)
+        start_date = earliest_start_day + timedelta(days=random_days)
 
     # Format dates to string in 'YYYY-MM-DD' format
     start_date_str = start_date.strftime("%Y-%m-%d")
     print(f"Start date: {start_date_str}")
     return start_date_str
-
-
-def run_parallel_backtest(mp_args: List[Tuple], cfg: Dict) -> List[Dict]:
-    n_jobs = joblib.cpu_count() if cfg["n_jobs"] == -1 else cfg["n_jobs"]
-    parallel = joblib.Parallel(n_jobs, verbose=10, max_nbytes=None)
-    results = parallel(
-        joblib.delayed(backtest_with_info_key)(*args) for args in mp_args
-    )
-    return results
 
 
 def validate_backtest_data_config(cfg: Dict) -> None:
