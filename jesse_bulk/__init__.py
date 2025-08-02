@@ -499,15 +499,60 @@ def get_candles_with_cache(
     if cache_file.is_file():
         with open(f"storage/bulk/{cache_file_name}", "rb") as handle:
             candles = pickle.load(handle)
-    else:
-        # Convert date strings to timestamps for Jesse's get_candles function
-        start_timestamp = jh.date_to_timestamp(start_date)
-        finish_timestamp = jh.date_to_timestamp(finish_date)
+            print(f"Loaded {len(candles) if candles is not None else 0} cached candles for {exchange} {symbol}")
+            return candles
+
+    # Try to find existing Jesse candle files first
+    start_timestamp = jh.date_to_timestamp(start_date)
+    finish_timestamp = jh.date_to_timestamp(finish_date)
+    
+    # Look for Jesse's candle pickle files in storage/temp
+    temp_path = pathlib.Path("storage/temp")
+    if temp_path.exists():
+        for pickle_file in temp_path.glob("*.pickle"):
+            if exchange in pickle_file.name and symbol in pickle_file.name:
+                try:
+                    # Extract timestamps from filename
+                    parts = pickle_file.stem.split("-")
+                    if len(parts) >= 2:
+                        file_start_ts = int(parts[0])
+                        file_end_ts = int(parts[1])
+                        
+                        # Check if this file covers our date range
+                        if file_start_ts <= start_timestamp and file_end_ts >= finish_timestamp:
+                            print(f"Found existing Jesse candle file: {pickle_file}")
+                            with open(pickle_file, "rb") as f:
+                                all_candles = pickle.load(f)
+                            
+                            # Filter candles to our date range
+                            filtered_candles = []
+                            for candle in all_candles:
+                                if start_timestamp <= candle[0] <= finish_timestamp:
+                                    filtered_candles.append(candle)
+                            
+                            candles = np.array(filtered_candles)
+                            print(f"Filtered to {len(candles)} candles for date range {start_date} to {finish_date}")
+                            
+                            # Cache for future use
+                            with open(f"storage/bulk/{cache_file_name}", "wb") as handle:
+                                pickle.dump(candles, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                            
+                            return candles
+                except Exception as e:
+                    print(f"Error reading Jesse candle file {pickle_file}: {e}")
+                    continue
+
+    # Fall back to Jesse's get_candles function
+    try:
+        print(f"Fetching candles for {exchange} {symbol} from {start_date} to {finish_date}")
         candles = get_candles(exchange, symbol, "1m", start_timestamp, finish_timestamp)
+        print(f"Fetched {len(candles) if candles is not None else 0} candles")
         with open(f"storage/bulk/{cache_file_name}", "wb") as handle:
             pickle.dump(candles, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
-    return candles
+        return candles
+    except Exception as e:
+        print(f"Error fetching candles for {exchange} {symbol}: {e}")
+        return np.array([])
 
 
 def _get_candles_with_warmup(
@@ -527,10 +572,15 @@ def _get_candles_with_warmup(
     # Get all candles including warmup
     all_candles = get_candles_with_cache(exchange, symbol, warmup_start_date, finish_date)
     
+    # Check if we got valid candles
+    if all_candles is None or len(all_candles) == 0:
+        print(f"Warning: No candles found for {exchange} {symbol} from {warmup_start_date} to {finish_date}")
+        return np.array([]), np.array([])
+    
     # Find the split point
     split_index = 0
     for i, candle in enumerate(all_candles):
-        if candle[0] >= start_ts:
+        if candle is not None and candle[0] >= start_ts:
             split_index = i
             break
     
@@ -558,60 +608,91 @@ def backtest_with_info_key(
     key, config, route, extra_routes, start_date, end_date, hp_dict, dna
 ):
     hp = _decode_dna(hp_dict, dna)
-
     got_exception = False
 
     try:
-        # Load candles for main route
-        main_exchange = route[0]['exchange']
-        main_symbol = route[0]['symbol']
+        # Use Jesse's research.get_candles to get candles properly
+        from jesse.research import get_candles as research_get_candles
         
-        # Prepare candles dictionary
+        # Convert dates to timestamps
+        start_timestamp = jh.date_to_timestamp(start_date)
+        end_timestamp = jh.date_to_timestamp(end_date)
+        warmup_num = config.get('warm_up_candles', 240)
+        
+        # Calculate correct warmup for the timeframe
+        # warmup_num is in terms of the strategy's timeframe, but research.get_candles expects 1m candles
+        main_timeframe = route[0]['timeframe']
+        timeframe_minutes = jh.timeframe_to_one_minutes(main_timeframe)
+        warmup_1m_candles = warmup_num * timeframe_minutes
+        
+        # Prepare candles and warmup_candles dictionaries
         candles = {}
         warmup_candles = {}
         
-        # Get warmup candles number from config
-        warmup_num = config.get('warm_up_candles', 240)
-        
         # Load main route candles
-        warmup_candles_arr, trading_candles_arr = _get_candles_with_warmup(
-            main_exchange, main_symbol, start_date, end_date, warmup_num
+        main_exchange = route[0]['exchange']
+        main_symbol = route[0]['symbol']
+        
+        # Use Jesse's research.get_candles function
+        warmup_arr, trading_arr = research_get_candles(
+            main_exchange, 
+            main_symbol, 
+            '1m',  # Always use 1m candles
+            start_timestamp, 
+            end_timestamp,
+            warmup_candles_num=warmup_1m_candles,  # Use calculated 1m candles
+            caching=True
         )
         
         key_str = jh.key(main_exchange, main_symbol)
         candles[key_str] = {
             'exchange': main_exchange,
             'symbol': main_symbol,
-            'candles': trading_candles_arr
+            'candles': trading_arr
         }
-        warmup_candles[key_str] = {
-            'exchange': main_exchange,
-            'symbol': main_symbol,
-            'candles': warmup_candles_arr
-        }
+        
+        if warmup_arr is not None and len(warmup_arr) > 0:
+            warmup_candles[key_str] = {
+                'exchange': main_exchange,
+                'symbol': main_symbol,
+                'candles': warmup_arr
+            }
         
         # Load extra route candles if any
         for extra_route in extra_routes:
             extra_exchange = extra_route['exchange']
             extra_symbol = extra_route['symbol']
             
-            warmup_arr, trading_arr = _get_candles_with_warmup(
-                extra_exchange, extra_symbol, start_date, end_date, warmup_num
+            # Calculate warmup for extra route timeframe
+            extra_timeframe = extra_route.get('timeframe', main_timeframe)
+            extra_timeframe_minutes = jh.timeframe_to_one_minutes(extra_timeframe)
+            extra_warmup_1m_candles = warmup_num * extra_timeframe_minutes
+            
+            extra_warmup, extra_trading = research_get_candles(
+                extra_exchange,
+                extra_symbol,
+                '1m',
+                start_timestamp,
+                end_timestamp,
+                warmup_candles_num=extra_warmup_1m_candles,
+                caching=True
             )
             
             key_str = jh.key(extra_exchange, extra_symbol)
             candles[key_str] = {
                 'exchange': extra_exchange,
                 'symbol': extra_symbol,
-                'candles': trading_arr
+                'candles': extra_trading
             }
-            warmup_candles[key_str] = {
-                'exchange': extra_exchange,
-                'symbol': extra_symbol,
-                'candles': warmup_arr
-            }
+            
+            if extra_warmup is not None and len(extra_warmup) > 0:
+                warmup_candles[key_str] = {
+                    'exchange': extra_exchange,
+                    'symbol': extra_symbol,
+                    'candles': extra_warmup
+                }
         
-        # Update routes to have only essential fields
+        # Prepare routes and data_routes in Jesse's expected format
         routes = []
         for r in route:
             routes.append({
@@ -626,29 +707,29 @@ def backtest_with_info_key(
             data_routes.append({
                 'exchange': r['exchange'],
                 'symbol': r['symbol'],
-                'timeframe': r['timeframe']
+                'timeframe': r['timeframe'],
             })
         
-        # Call the new backtest function
+        # Call Jesse's research.backtest function
         result = backtest(
             config=config,
             routes=routes,
             data_routes=data_routes,
             candles=candles,
-            warmup_candles=warmup_candles,
+            warmup_candles=warmup_candles if warmup_candles else None,
             hyperparameters=hp,
-            fast_mode=True  # Use fast mode for bulk testing
+            fast_mode=True
         )
         backtest_data = result["metrics"]
+        
     except Exception as e:
         logger = start_logger_if_necessary()
         logger.error(
             "".join(traceback.TracebackException.from_exception(e).format()),
             extra={"key": key},
         )
-        # Re-raise the original exception so the Pool worker can
-        # clean up
         got_exception = True
+        backtest_data = {}
 
     if got_exception or backtest_data.get("total", 0) == 0:
         backtest_data = {
