@@ -1,19 +1,34 @@
 import pathlib
 
 import pandas as pd
+from .optuna_reader import read_optuna_study, find_optuna_databases
 
 
-def filter_and_sort_dna_df(csv_path: str, cfg: dict):
-    dna_df = pd.read_csv(csv_path, encoding='utf-8', sep='\t')
-
-    # old csv
-    if 'dna' not in dna_df:
-        dna_df = pd.read_csv(csv_path, encoding='utf-8')
-        dna_df.rename(columns={"training_log.win-rate": "training_log.win_rate",
-                               "training_log.PNL": "training_log.net_profit_percentage",
-                               "testing_log.win-rate": "testing_log.win_rate",
-                               "testing_log.PNL": "testing_log.net_profit_percentage"}, inplace=True)
-
+def filter_and_sort_dna_df(db_path: str, cfg: dict):
+    """
+    Filter and sort DNA data from Optuna database.
+    
+    Args:
+        db_path: Path to Optuna SQLite database file
+        cfg: Configuration dictionary
+        
+    Returns:
+        Filtered and sorted DataFrame
+    """
+    # Load data from Optuna database
+    if not db_path.endswith('.db'):
+        # Try to auto-detect Optuna database in project
+        db_paths = find_optuna_databases()
+        if db_paths:
+            print(f"Found Optuna database: {db_paths[0]}")
+            db_path = db_paths[0]
+        else:
+            raise ValueError("No Optuna database found. Please provide path to .db file")
+    
+    study_name = cfg.get('optuna_study_name', None)
+    dna_df = read_optuna_study(db_path, study_name)
+    
+    # Remove duplicates based on DNA
     dna_df.drop_duplicates(subset=['dna'], inplace=True)
 
     for metric in cfg['filter_dna']['training'].items():
@@ -35,8 +50,13 @@ def filter_and_sort_dna_df(csv_path: str, cfg: dict):
             dna_df.drop(dna_df[dna_df[f'testing_log.{key}'] > max_value].index, inplace=True)
 
     dna_df.sort_values(by=[cfg['sort_by']], ascending=False, inplace=True)
-    old_name = pathlib.Path(csv_path).stem
-    new_path = pathlib.Path(csv_path).with_stem(f'{old_name}-picked')
+    
+    # Generate output filename
+    db_path_obj = pathlib.Path(db_path)
+    new_path = db_path_obj.with_suffix('.csv').with_stem(f'{db_path_obj.stem}-picked')
+    
+    # Save with tab separator (Jesse's format)
     dna_df.to_csv(new_path, header=True, index=False, encoding='utf-8', sep='\t')
+    print(f"Saved filtered results to: {new_path}")
 
     return dna_df

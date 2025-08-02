@@ -1,14 +1,15 @@
 from setuptools import setup, find_packages
 
 # also change in version.py
-VERSION = '0.1.5'
-DESCRIPTION = "Bulk backtesting for jesse"
+VERSION = '0.2.0'
+DESCRIPTION = "Bulk backtesting for Jesse - now with Optuna support"
 
 REQUIRED_PACKAGES = [
     'jesse',
     'pyyaml',
     'joblib',
-    'psutil'
+    'psutil',
+    'optuna'
 ]
 
 with open("README.md", "r", encoding="utf-8") as f:

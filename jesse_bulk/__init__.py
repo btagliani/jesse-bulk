@@ -17,8 +17,7 @@ import numpy as np
 import pandas as pd
 import pkg_resources
 import yaml
-from jesse.research import get_candles
-from jesse.research.backtest import backtest_with_dates
+from jesse.research import get_candles, backtest
 
 
 def start_logger_if_necessary():
@@ -50,36 +49,36 @@ def create_config() -> None:
 
 
 @cli.command()
-@click.argument("csv_path", required=True, type=str)
-def pick(csv_path: str) -> None:
+@click.argument("db_path", required=True, type=str)
+def pick(db_path: str) -> None:
     from .picker import filter_and_sort_dna_df
 
     cfg = get_config()
 
-    filter_and_sort_dna_df(csv_path, cfg)
+    filter_and_sort_dna_df(db_path, cfg)
 
 
 @cli.command()
 @click.argument("strategy_name", required=True, type=str)
-@click.argument("csv_path", required=True, type=str)
-def refine(strategy_name: str, csv_path: str) -> None:
+@click.argument("db_path", required=True, type=str)
+def refine(strategy_name: str, db_path: str) -> None:
+    from .optuna_reader import read_optuna_study, find_optuna_databases
+    
     validate_cwd()
-
-    dna_df = pd.read_csv(csv_path, encoding="utf-8", sep="\t")
-
-    # old csv
-    if "dna" not in dna_df:
-        dna_df = pd.read_csv(csv_path, encoding="utf-8")
-        dna_df.rename(
-            columns={
-                "training_log.win-rate": "training_log.win_rate",
-                "training_log.PNL": "training_log.net_profit_percentage",
-                "testing_log.win-rate": "testing_log.win_rate",
-                "testing_log.PNL": "testing_log.net_profit_percentage",
-            },
-            inplace=True,
-        )
     cfg = get_config()
+
+    # Load data from Optuna database
+    if not db_path.endswith('.db'):
+        # Try to auto-detect Optuna database in project
+        db_paths = find_optuna_databases()
+        if db_paths:
+            print(f"Found Optuna database: {db_paths[0]}")
+            db_path = db_paths[0]
+        else:
+            raise ValueError("No Optuna database found. Please provide path to .db file")
+    
+    study_name = cfg.get('optuna_study_name', None)
+    dna_df = read_optuna_study(db_path, study_name)
 
     StrategyClass = jh.get_strategy_class(strategy_name)
     hp_dict = StrategyClass().hyperparameters()
@@ -174,8 +173,8 @@ def refine(strategy_name: str, csv_path: str) -> None:
         joblib.delayed(backtest_with_info_key)(*args) for args in mp_args
     )
 
-    old_name = pathlib.Path(csv_path).stem
-    new_path = pathlib.Path(csv_path).with_stem(f"{old_name}-results")
+    old_name = pathlib.Path(db_path).stem
+    new_path = pathlib.Path(db_path).with_suffix('.csv').with_stem(f"{old_name}-results")
 
     results_df = pd.DataFrame.from_dict(results, orient="columns")
 
@@ -501,24 +500,146 @@ def get_candles_with_cache(
         with open(f"storage/bulk/{cache_file_name}", "rb") as handle:
             candles = pickle.load(handle)
     else:
-        candles = get_candles(exchange, symbol, "1m", start_date, finish_date)
+        # Convert date strings to timestamps for Jesse's get_candles function
+        start_timestamp = jh.date_to_timestamp(start_date)
+        finish_timestamp = jh.date_to_timestamp(finish_date)
+        candles = get_candles(exchange, symbol, "1m", start_timestamp, finish_timestamp)
         with open(f"storage/bulk/{cache_file_name}", "wb") as handle:
             pickle.dump(candles, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
     return candles
 
 
+def _get_candles_with_warmup(
+    exchange: str, symbol: str, start_date: str, finish_date: str, warmup_candles: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Get candles with warmup period included.
+    
+    Returns:
+        Tuple of (warmup_candles, trading_candles)
+    """
+    # Calculate warmup start date
+    start_ts = jh.date_to_timestamp(start_date)
+    warmup_start_ts = start_ts - (warmup_candles * 60_000)  # 1m candles
+    warmup_start_date = jh.timestamp_to_date(warmup_start_ts)
+    
+    # Get all candles including warmup
+    all_candles = get_candles_with_cache(exchange, symbol, warmup_start_date, finish_date)
+    
+    # Find the split point
+    split_index = 0
+    for i, candle in enumerate(all_candles):
+        if candle[0] >= start_ts:
+            split_index = i
+            break
+    
+    # Split into warmup and trading candles
+    warmup = all_candles[:split_index] if split_index > 0 else np.array([])
+    trading = all_candles[split_index:] if split_index < len(all_candles) else all_candles
+    
+    return warmup, trading
+
+
+def _decode_dna(hp_dict, dna):
+    """
+    Decode DNA string to hyperparameters (base64 format only).
+    """
+    if not dna:
+        return None
+        
+    import base64
+    import json
+    decoded = base64.b64decode(dna.encode()).decode()
+    return json.loads(decoded)
+
+
 def backtest_with_info_key(
     key, config, route, extra_routes, start_date, end_date, hp_dict, dna
 ):
-    hp = jh.dna_to_hp(hp_dict, dna) if dna else None
+    hp = _decode_dna(hp_dict, dna)
 
     got_exception = False
 
     try:
-        backtest_data = backtest_with_dates(
-            config, route, extra_routes, start_date, end_date, hyperparameters=hp
-        )["metrics"]
+        # Load candles for main route
+        main_exchange = route[0]['exchange']
+        main_symbol = route[0]['symbol']
+        
+        # Prepare candles dictionary
+        candles = {}
+        warmup_candles = {}
+        
+        # Get warmup candles number from config
+        warmup_num = config.get('warm_up_candles', 240)
+        
+        # Load main route candles
+        warmup_candles_arr, trading_candles_arr = _get_candles_with_warmup(
+            main_exchange, main_symbol, start_date, end_date, warmup_num
+        )
+        
+        key_str = jh.key(main_exchange, main_symbol)
+        candles[key_str] = {
+            'exchange': main_exchange,
+            'symbol': main_symbol,
+            'candles': trading_candles_arr
+        }
+        warmup_candles[key_str] = {
+            'exchange': main_exchange,
+            'symbol': main_symbol,
+            'candles': warmup_candles_arr
+        }
+        
+        # Load extra route candles if any
+        for extra_route in extra_routes:
+            extra_exchange = extra_route['exchange']
+            extra_symbol = extra_route['symbol']
+            
+            warmup_arr, trading_arr = _get_candles_with_warmup(
+                extra_exchange, extra_symbol, start_date, end_date, warmup_num
+            )
+            
+            key_str = jh.key(extra_exchange, extra_symbol)
+            candles[key_str] = {
+                'exchange': extra_exchange,
+                'symbol': extra_symbol,
+                'candles': trading_arr
+            }
+            warmup_candles[key_str] = {
+                'exchange': extra_exchange,
+                'symbol': extra_symbol,
+                'candles': warmup_arr
+            }
+        
+        # Update routes to have only essential fields
+        routes = []
+        for r in route:
+            routes.append({
+                'exchange': r['exchange'],
+                'symbol': r['symbol'],
+                'timeframe': r['timeframe'],
+                'strategy': r['strategy']
+            })
+        
+        data_routes = []
+        for r in extra_routes:
+            data_routes.append({
+                'exchange': r['exchange'],
+                'symbol': r['symbol'],
+                'timeframe': r['timeframe']
+            })
+        
+        # Call the new backtest function
+        result = backtest(
+            config=config,
+            routes=routes,
+            data_routes=data_routes,
+            candles=candles,
+            warmup_candles=warmup_candles,
+            hyperparameters=hp,
+            fast_mode=True  # Use fast mode for bulk testing
+        )
+        backtest_data = result["metrics"]
     except Exception as e:
         logger = start_logger_if_necessary()
         logger.error(
@@ -529,7 +650,7 @@ def backtest_with_info_key(
         # clean up
         got_exception = True
 
-    if got_exception or backtest_data["total"] == 0:
+    if got_exception or backtest_data.get("total", 0) == 0:
         backtest_data = {
             "total": 0,
             "total_winning_trades": None,
