@@ -275,6 +275,30 @@ def bulk(strategy_name: str) -> None:
 
 
 @cli.command()
+@click.option("--min-success-rate", type=float, default=90.0, help="Minimum success rate % (default: 90)")
+@click.option("--min-avg-balance", type=float, default=100000.0, help="Minimum average balance (default: 100000)")
+@click.option("--min-lowest-balance", type=float, default=5000.0, help="Minimum lowest balance (default: 5000)")
+@click.option("--min-avg-profit", type=float, default=200.0, help="Minimum average profit % (default: 200)")
+@click.option("--require-wins", is_flag=True, help="Remove DNAs with zero wins")
+@click.option("--confirm", is_flag=True, help="Actually remove DNAs (default is dry run)")
+def prune_hall_of_fame(min_success_rate: float, min_avg_balance: float, 
+                      min_lowest_balance: float, min_avg_profit: float, 
+                      require_wins: bool, confirm: bool) -> None:
+    """Prune Hall of Fame by removing underperforming DNAs based on test results"""
+    from .hall_of_fame import get_hall_of_fame
+    
+    hof = get_hall_of_fame()
+    hof.prune_by_performance(
+        min_success_rate=min_success_rate,
+        min_avg_balance=min_avg_balance,
+        min_lowest_balance=min_lowest_balance,
+        min_avg_profit=min_avg_profit,
+        require_wins=require_wins,
+        dry_run=not confirm
+    )
+
+
+@cli.command()
 @click.argument("strategy_name", required=False)
 @click.option("--top-n", default=10, help="Number of top DNAs to test (default: 10)")
 @click.option("--runs-per-dna", default=5, help="Number of runs per DNA (default: 5)")
@@ -282,11 +306,12 @@ def bulk(strategy_name: str) -> None:
 @click.option("--export-csv", help="Export hall of fame to CSV file")
 @click.option("--min-sharpe", type=float, help="Minimum Sharpe ratio filter")
 @click.option("--min-profit", type=float, help="Minimum profit percentage filter")
+@click.option("--min-trades", type=int, default=20, help="Minimum number of trades filter (default: 20, use 0 to disable)")
 @click.option("--show-stats", is_flag=True, help="Show hall of fame statistics")
 def hall_of_fame(strategy_name: Optional[str], top_n: int, runs_per_dna: int, 
                 timeframes: Tuple[str], export_csv: Optional[str],
                 min_sharpe: Optional[float], min_profit: Optional[float],
-                show_stats: bool) -> None:
+                min_trades: int, show_stats: bool) -> None:
     """Test the best DNAs from the Hall of Fame across multiple time periods and timeframes"""
     from .hall_of_fame import get_hall_of_fame
     
@@ -342,7 +367,7 @@ def hall_of_fame(strategy_name: Optional[str], top_n: int, runs_per_dna: int,
     best_dnas_df = hof.get_best_dnas(
         strategy_name=strategy_name,
         limit=top_n,
-        min_trades=20  # Ensure meaningful results
+        min_trades=min_trades if min_trades > 0 else None  # Use None to disable filter
     )
     
     if best_dnas_df.empty:
@@ -432,7 +457,9 @@ def hall_of_fame(strategy_name: Optional[str], top_n: int, runs_per_dna: int,
                     "timeframe": timeframe,
                 }]
                 
-                key = f'{symbol}-{timeframe}-{start_date}-{end_date}-{dna_str}'
+                # Use short hash for readability
+                dna_hash = hashlib.sha256(dna_str.encode()).hexdigest()[:16]
+                key = f'{symbol}-{timeframe}-{start_date}-{end_date}-...{dna_hash[-8:]}'
                 mp_args.append((
                     key,
                     config,
@@ -454,7 +481,7 @@ def hall_of_fame(strategy_name: Optional[str], top_n: int, runs_per_dna: int,
     
     # Process results
     results_df = pd.DataFrame.from_dict(all_results, orient="columns")
-    results_df["dna"] = results_df["key"].apply(lambda x: x.split("-")[-1])
+    # DNA is now included directly in the results, no need to extract from key
     results_df["timeframe"] = results_df["key"].apply(lambda x: x.split("-")[2])
     
     # Calculate statistics by DNA and timeframe
@@ -483,6 +510,18 @@ def hall_of_fame(strategy_name: Optional[str], top_n: int, runs_per_dna: int,
             avg_profit = tf_results['net_profit_percentage'].mean() if 'net_profit_percentage' in tf_results and not tf_results.empty else 0
             avg_winrate = tf_results['win_rate'].mean() if 'win_rate' in tf_results and not tf_results.empty else 0
             
+            # Calculate finishing balance statistics
+            if 'finishing_balance' in tf_results and not tf_results.empty:
+                finishing_balances = tf_results['finishing_balance'].dropna()
+                if len(finishing_balances) > 0:
+                    avg_finishing = finishing_balances.mean()
+                    min_finishing = finishing_balances.min()
+                    max_finishing = finishing_balances.max()
+                else:
+                    avg_finishing = min_finishing = max_finishing = 0
+            else:
+                avg_finishing = min_finishing = max_finishing = 0
+            
             # Calculate success rate based on presence of key metrics
             # Successful runs have 'sharpe_ratio', failed runs might have 'status' or missing values
             if 'sharpe_ratio' in tf_results.columns:
@@ -498,6 +537,8 @@ def hall_of_fame(strategy_name: Optional[str], top_n: int, runs_per_dna: int,
             print(f"     - Avg Sharpe: {avg_sharpe:.2f}")
             print(f"     - Avg Profit: {avg_profit:.1f}%")
             print(f"     - Avg Win Rate: {avg_winrate:.1%}")
+            print(f"     - Avg Balance: ${avg_finishing:,.2f}")
+            print(f"     - Balance Range: ${min_finishing:,.2f} - ${max_finishing:,.2f}")
             
             # Store performance history
             for _, result in tf_results.iterrows():
@@ -524,6 +565,43 @@ def hall_of_fame(strategy_name: Optional[str], top_n: int, runs_per_dna: int,
     
     print(f"\n💾 Detailed results saved to: hall_of_fame_test_{dt}.csv")
     print(f"📊 Performance history updated in Hall of Fame database")
+    
+    # Award wins based on performance
+    hof.award_wins(results_df)
+
+
+@cli.command()
+@click.option("--min-wins", type=int, default=1, help="Minimum wins to show (default: 1)")
+def leaderboard(min_wins: int) -> None:
+    """Show Hall of Fame leaderboard sorted by wins"""
+    from .hall_of_fame import get_hall_of_fame
+    
+    hof = get_hall_of_fame()
+    df = hof.get_leaderboard(min_wins=min_wins)
+    
+    if df.empty:
+        print(f"No DNAs with at least {min_wins} win(s) found.")
+        return
+    
+    print("\n🏆 HALL OF FAME LEADERBOARD")
+    print("="*80)
+    print(f"{'Rank':<5} {'DNA':<12} {'Wins':<6} {'Avg Score':<10} {'Total Score':<12} {'Strategy':<15}")
+    print("-"*80)
+    
+    for idx, row in df.iterrows():
+        rank = idx + 1
+        dna_short = f"...{row['dna_hash'][-8:]}"
+        avg_score = row['avg_win_score'] if pd.notna(row['avg_win_score']) else 0
+        
+        print(f"{rank:<5} {dna_short:<12} {row['wins']:<6} {avg_score:<10.1f} {row['win_score']:<12.1f} {row['strategy_name']:<15}")
+        
+        if rank <= 3:  # Show details for top 3
+            print(f"      Original: {row['original_sharpe']:.2f} Sharpe, {row['original_profit']:.1f}% profit")
+            if pd.notna(row['last_win_date']):
+                print(f"      Last win: {row['last_win_date'][:10]}")
+    
+    print("="*80)
+    print(f"\nTotal DNAs with wins: {len(df)}")
 
 
 @cli.command()
@@ -858,8 +936,7 @@ def refine_best(db_path: str, top_n: int, runs_per_dna: int, selection_preset: O
     # Convert all results to a DataFrame
     results_df = pd.DataFrame.from_dict(all_results, orient="columns")
 
-    # Add a column for the DNA based on the 'key' column
-    results_df["dna"] = results_df["key"].apply(lambda x: x.split("-")[-1])
+    # DNA is now included directly in the results, no need to extract from key
 
     # Group by DNA and calculate the average for each group (only numeric columns)
     average_results = results_df.groupby("dna").mean(numeric_only=True)
@@ -1405,7 +1482,7 @@ def backtest_with_info_key(
         if got_exception:
             backtest_data["total"] = "error"
 
-    return {**{"key": key}, **backtest_data}
+    return {**{"key": key, "dna": dna}, **backtest_data}
 
 
 def get_config():

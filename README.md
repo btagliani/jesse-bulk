@@ -16,7 +16,16 @@ Runs backtests with specific DNAs from Optuna optimization results. Perfect for 
 Runs basic backtests according to your configuration (symbols, timeframes, timespans) without specific hyperparameters. Uses default strategy parameters.
 
 **`jesse-bulk refine-best [db_path] --top-n N --runs-per-dna R`**  
-🆕 Tests the top N performing DNAs with R random time periods each. Ideal for robustness testing of your best strategies.
+🆕 Tests the top N performing DNAs with R random time periods each. Ideal for robustness testing of your best strategies. Supports multiple selection presets (conservative, aggressive, balanced, robust) or test all presets with `--all-presets`.
+
+**`jesse-bulk hall-of-fame [strategy] --top-n N --runs-per-dna R`**  
+🆕 Tests the best DNAs from your Hall of Fame (persistent storage of top performers). Awards wins based on composite performance scoring.
+
+**`jesse-bulk leaderboard --min-wins 1`**  
+🆕 Shows the Hall of Fame leaderboard ranked by total wins. DNAs earn wins by consistently performing well across different market conditions.
+
+**`jesse-bulk prune-hall-of-fame --min-success-rate 80 --confirm`**  
+🆕 Removes underperforming DNAs from Hall of Fame based on test results. Use --confirm to actually delete (otherwise dry run).
 
 **`jesse-bulk create-config`**  
 Creates a `bulk_config.yml` template file in your project directory.
@@ -29,6 +38,8 @@ Creates a `bulk_config.yml` template file in your project directory.
 - **Smart Caching**: Uses Jesse's existing candle cache system for optimal performance
 - **Filtering & Sorting**: Advanced filtering based on performance metrics
 - **Result Analysis**: CSV output with comprehensive backtest metrics
+- **Hall of Fame**: Persistent storage of best performing DNAs with win tracking
+- **Selection Presets**: Multiple DNA selection strategies (conservative, aggressive, balanced, robust)
 
 ## 📋 Requirements
 
@@ -139,6 +150,53 @@ jesse-bulk refine YourStrategy storage/temp/optuna/optuna_study.db
 jesse-bulk refine-best storage/temp/optuna/optuna_study.db --top-n 10 --runs-per-dna 5
 ```
 
+### 2. Advanced Workflow: refine-best → hall-of-fame → leaderboard
+
+This workflow demonstrates the full DNA selection and tracking system:
+
+```bash
+# Step 1: Find the best DNAs using advanced selection presets
+# Test all presets to find the "king DNA"
+jesse-bulk refine-best storage/temp/optuna/optuna_study.db --all-presets --top-n 5 --runs-per-dna 10
+
+# Output: Finds top performers across conservative, aggressive, balanced, and robust selection methods
+# The best DNAs are automatically added to the Hall of Fame
+
+# Step 2: Test Hall of Fame DNAs across different market conditions
+# This awards "wins" to DNAs that consistently perform well
+jesse-bulk hall-of-fame --top-n 10 --runs-per-dna 10 --min-trades 20
+
+# Output: Tests stored DNAs and awards wins based on composite scoring:
+# - 50% Success Rate (avoiding bankruptcy is critical)
+# - 20% Average Profit
+# - 15% Average Sharpe Ratio
+# - 10% Average Finishing Balance
+# - 5% Minimum Balance
+
+# Step 3: View the leaderboard to see which DNAs consistently win
+jesse-bulk leaderboard
+
+# Output shows:
+# 🏆 HALL OF FAME LEADERBOARD
+# Rank  DNA          Wins   Avg Score  Total Score  Strategy
+# 1     ...0725b7a2  3      85.2       255.6        Rainmaker
+# 2     ...90a748d0  2      78.5       157.0        Rainmaker
+
+# Step 4: Clean up underperformers (optional)
+# Remove DNAs that don't meet performance criteria
+jesse-bulk prune-hall-of-fame --min-success-rate 80 --min-avg-profit 200 --confirm
+```
+
+### Selection Presets Explained
+
+When using `refine-best`, you can choose different selection strategies:
+
+- **`--selection-preset conservative`**: Prioritizes consistency and low drawdown
+- **`--selection-preset aggressive`**: Focuses on maximum returns
+- **`--selection-preset balanced`**: Balances risk and reward (default)
+- **`--selection-preset robust`**: Emphasizes cross-validation and overfitting detection
+- **`--all-presets`**: Tests all presets to find the ultimate best DNA
+
 ### 2. Command Examples
 
 ```bash
@@ -215,6 +273,51 @@ timespans:
 
 This configuration will run backtests for each combination: 3 symbols × 2 timeframes × 2 timespans = 12 backtests per DNA.
 
+## 🏆 Hall of Fame System
+
+The Hall of Fame is a persistent storage system that tracks your best performing DNAs over time. It solves a common problem: finding DNAs that perform well not just in their optimization period, but consistently across different market conditions.
+
+### How It Works
+
+1. **DNA Storage**: When you run `refine-best`, top performers are automatically added to the Hall of Fame SQLite database (`storage/hall_of_fame.db`)
+
+2. **Performance Testing**: Use `hall-of-fame` command to test stored DNAs across random time periods
+
+3. **Win System**: DNAs earn "wins" based on composite scoring:
+   - **50%** - Success Rate (must be ≥80% to qualify)
+   - **20%** - Average Profit
+   - **15%** - Average Sharpe Ratio
+   - **10%** - Average Finishing Balance
+   - **5%** - Minimum Balance (risk control)
+
+4. **Leaderboard**: Track which DNAs consistently win across different tests
+
+### Why Success Rate Matters Most
+
+The scoring heavily weights success rate (50%) because in real trading:
+- A strategy that fails 60% of the time means bankruptcy 6 out of 10 times
+- You can't compound gains if you go broke
+- Consistency beats home runs
+
+### Hall of Fame Commands
+
+```bash
+# View statistics
+jesse-bulk hall-of-fame --show-stats
+
+# Test top 10 DNAs with 5 runs each
+jesse-bulk hall-of-fame --top-n 10 --runs-per-dna 5
+
+# Export to CSV
+jesse-bulk hall-of-fame --export-csv my_hall_of_fame.csv
+
+# View leaderboard
+jesse-bulk leaderboard
+
+# Clean up underperformers
+jesse-bulk prune-hall-of-fame --min-success-rate 80 --confirm
+```
+
 ## 🐛 Troubleshooting
 
 ### Common Issues
@@ -243,7 +346,16 @@ Reduce `n_jobs` in config or clear the `storage/bulk` cache directory.
 
 ## 🔄 What's New
 
-### v2.0 Updates (Latest)
+### v2.1 Updates (Latest)
+- ✅ **Hall of Fame System**: Persistent storage of best performing DNAs
+- ✅ **Win Tracking**: DNAs earn wins through consistent performance
+- ✅ **Selection Presets**: Conservative, aggressive, balanced, and robust selection methods
+- ✅ **Leaderboard**: Track which DNAs consistently outperform
+- ✅ **Performance Pruning**: Remove underperforming DNAs based on test results
+- ✅ **Composite Scoring**: Multi-criteria evaluation prioritizing success rate (50% weight)
+- ✅ **All-Presets Mode**: Test all selection methods to find the ultimate "king DNA"
+
+### v2.0 Updates
 - ✅ **Full Optuna Support**: Native integration with Optuna SQLite databases
 - ✅ **Base64 DNA Decoding**: Handles modern Jesse optimization format
 - ✅ **Multi-timeframe Fix**: Correctly calculates warmup for any timeframe

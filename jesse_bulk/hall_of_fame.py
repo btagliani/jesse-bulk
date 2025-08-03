@@ -11,7 +11,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import hashlib
 
 
@@ -121,6 +121,17 @@ class HallOfFame:
         """)
         
         conn.commit()
+        
+        # Add new columns if they don't exist (for backward compatibility)
+        try:
+            cursor.execute("ALTER TABLE dna_records ADD COLUMN wins INTEGER DEFAULT 0")
+            cursor.execute("ALTER TABLE dna_records ADD COLUMN win_score REAL DEFAULT 0.0")
+            cursor.execute("ALTER TABLE dna_records ADD COLUMN last_win_date TIMESTAMP")
+            conn.commit()
+        except sqlite3.OperationalError:
+            # Columns already exist
+            pass
+        
         conn.close()
     
     def add_dna(self, dna: str, metrics: Dict, strategy_name: str, 
@@ -452,6 +463,371 @@ class HallOfFame:
         
         df.to_csv(output_path, index=False)
         print(f"Exported {len(df)} DNAs to {output_path}")
+    
+    def prune_by_performance(self, min_success_rate: float = 90.0,
+                           min_avg_balance: float = 100000.0,
+                           min_lowest_balance: float = 5000.0,
+                           min_avg_profit: float = 200.0,
+                           require_wins: bool = False,
+                           dry_run: bool = True) -> Dict[str, Any]:
+        """
+        Remove DNAs that don't meet performance criteria based on their test history
+        
+        Args:
+            min_success_rate: Minimum success rate percentage (default: 90%)
+            min_avg_balance: Minimum average finishing balance (default: $100k)
+            min_lowest_balance: Minimum lowest finishing balance (default: $5k)
+            min_avg_profit: Minimum average profit percentage (default: 200%)
+            require_wins: If True, remove DNAs with zero wins (default: False)
+            dry_run: If True, only show what would be removed without deleting
+            
+        Returns:
+            Dictionary with pruning statistics
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Get all DNAs with their performance statistics
+        query = """
+            SELECT 
+                dr.id,
+                dr.dna,
+                dr.dna_hash,
+                dr.strategy_name,
+                dr.sharpe_ratio as original_sharpe,
+                dr.net_profit_percentage as original_profit,
+                dr.wins,
+                COUNT(ph.id) as total_tests,
+                SUM(CASE WHEN ph.sharpe_ratio IS NOT NULL THEN 1 ELSE 0 END) as successful_tests,
+                AVG(CASE WHEN ph.finishing_balance IS NOT NULL THEN ph.finishing_balance ELSE NULL END) as avg_balance,
+                MIN(CASE WHEN ph.finishing_balance IS NOT NULL THEN ph.finishing_balance ELSE NULL END) as min_balance,
+                MAX(CASE WHEN ph.finishing_balance IS NOT NULL THEN ph.finishing_balance ELSE NULL END) as max_balance,
+                AVG(CASE WHEN ph.net_profit_percentage IS NOT NULL THEN ph.net_profit_percentage ELSE NULL END) as avg_profit
+            FROM dna_records dr
+            LEFT JOIN performance_history ph ON dr.id = ph.dna_record_id
+                AND ph.test_type IN ('hall_of_fame_test', 'refine-best')
+            GROUP BY dr.id, dr.dna, dr.dna_hash, dr.strategy_name, dr.wins
+        """
+        
+        df = pd.read_sql_query(query, conn)
+        
+        # Calculate success rate
+        df['success_rate'] = (df['successful_tests'] / df['total_tests'] * 100).fillna(0)
+        
+        # DNAs with no test history
+        no_tests = df[df['total_tests'] == 0]
+        
+        # Apply filters
+        conditions = (df['total_tests'] > 0) & (  # Has been tested
+            (df['success_rate'] < min_success_rate) |
+            (df['avg_balance'] < min_avg_balance) |
+            (df['min_balance'] < min_lowest_balance) |
+            (df['avg_profit'] < min_avg_profit)
+        )
+        
+        # Add wins requirement if specified
+        if require_wins:
+            # Include DNAs with zero wins in removal list
+            conditions = conditions | ((df['wins'].isna()) | (df['wins'] == 0))
+        
+        to_remove = df[conditions]
+        
+        # DNAs that pass all criteria
+        keep_conditions = (
+            (df['total_tests'] > 0) &
+            (df['success_rate'] >= min_success_rate) &
+            (df['avg_balance'] >= min_avg_balance) &
+            (df['min_balance'] >= min_lowest_balance) &
+            (df['avg_profit'] >= min_avg_profit)
+        )
+        
+        if require_wins:
+            # Must also have at least one win
+            keep_conditions = keep_conditions & (df['wins'] > 0)
+        
+        to_keep = df[keep_conditions]
+        
+        stats = {
+            'total_dnas': len(df),
+            'no_test_history': len(no_tests),
+            'to_remove': len(to_remove),
+            'to_keep': len(to_keep),
+            'criteria': {
+                'min_success_rate': min_success_rate,
+                'min_avg_balance': min_avg_balance,
+                'min_lowest_balance': min_lowest_balance,
+                'min_avg_profit': min_avg_profit
+            }
+        }
+        
+        print("\n🧹 HALL OF FAME PRUNING ANALYSIS")
+        print("="*60)
+        print(f"Total DNAs: {stats['total_dnas']}")
+        print(f"DNAs with no test history: {stats['no_test_history']}")
+        print(f"DNAs to remove: {stats['to_remove']}")
+        print(f"DNAs to keep: {stats['to_keep']}")
+        
+        print(f"\nRemoval Criteria:")
+        print(f"  - Success Rate < {min_success_rate}%")
+        print(f"  - Avg Balance < ${min_avg_balance:,.2f}")
+        print(f"  - Lowest Balance < ${min_lowest_balance:,.2f}")
+        print(f"  - Avg Profit < {min_avg_profit}%")
+        if require_wins:
+            print(f"  - Zero wins (never won in any test)")
+        
+        if len(to_remove) > 0:
+            print("\nDNAs to be removed:")
+            for _, row in to_remove.iterrows():
+                print(f"\n  ...{row['dna_hash'][-8:]} ({row['strategy_name']})")
+                print(f"    - Wins: {int(row['wins']) if pd.notna(row['wins']) else 0}")
+                print(f"    - Success Rate: {row['success_rate']:.0f}%")
+                print(f"    - Avg Balance: ${row['avg_balance']:,.2f}")
+                print(f"    - Min Balance: ${row['min_balance']:,.2f}")
+                print(f"    - Avg Profit: {row['avg_profit']:.1f}%")
+        
+        if len(to_keep) > 0:
+            print("\nTop performers to keep:")
+            for _, row in to_keep.head(5).iterrows():
+                print(f"\n  ...{row['dna_hash'][-8:]} ({row['strategy_name']})")
+                print(f"    - Wins: {int(row['wins']) if pd.notna(row['wins']) else 0}")
+                print(f"    - Success Rate: {row['success_rate']:.0f}%")
+                print(f"    - Avg Balance: ${row['avg_balance']:,.2f}")
+                print(f"    - Min Balance: ${row['min_balance']:,.2f}")
+                print(f"    - Avg Profit: {row['avg_profit']:.1f}%")
+        
+        if not dry_run and len(to_remove) > 0:
+            # Delete the DNAs and their performance history
+            dna_ids = to_remove['id'].tolist()
+            placeholders = ','.join('?' * len(dna_ids))
+            
+            cursor.execute(f"DELETE FROM performance_history WHERE dna_record_id IN ({placeholders})", dna_ids)
+            cursor.execute(f"DELETE FROM dna_records WHERE id IN ({placeholders})", dna_ids)
+            
+            conn.commit()
+            print(f"\n✅ Removed {len(to_remove)} DNAs from Hall of Fame")
+        elif dry_run:
+            print("\n⚠️  DRY RUN - No changes made. Run with dry_run=False to actually remove DNAs")
+        
+        conn.close()
+        return stats
+
+
+    def award_wins(self, test_results_df: pd.DataFrame, test_type: str = "hall_of_fame_test", 
+                   weights: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+        """
+        Award wins to DNAs based on their performance in a test batch
+        
+        Uses a weighted composite score:
+        - 30% Success Rate (percentage of runs without errors)
+        - 25% Average Profit 
+        - 20% Average Sharpe Ratio
+        - 15% Average Finishing Balance
+        - 10% Minimum Balance (risk control)
+        
+        You can customize weights by passing a weights dict:
+        weights = {
+            'success_rate': 0.40,  # Prioritize reliability
+            'avg_profit': 0.20,
+            'avg_sharpe': 0.20,
+            'avg_balance': 0.10,
+            'min_balance': 0.10
+        }
+        
+        Args:
+            test_results_df: DataFrame with test results including 'dna' column
+            test_type: Type of test for tracking
+            
+        Returns:
+            Dictionary with win statistics
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Group by DNA and calculate statistics
+        dna_stats = []
+        for dna_str in test_results_df['dna'].unique():
+            dna_results = test_results_df[test_results_df['dna'] == dna_str]
+            
+            # Calculate success rate
+            if 'sharpe_ratio' in dna_results.columns:
+                successful_runs = dna_results['sharpe_ratio'].notna().sum()
+                total_runs = len(dna_results)
+                success_rate = (successful_runs / total_runs) if total_runs > 0 else 0
+            else:
+                success_rate = 0
+            
+            # Calculate averages (only for successful runs)
+            successful_results = dna_results[dna_results['sharpe_ratio'].notna()]
+            
+            if len(successful_results) > 0:
+                avg_profit = successful_results['net_profit_percentage'].mean()
+                avg_sharpe = successful_results['sharpe_ratio'].mean()
+                avg_balance = successful_results['finishing_balance'].mean()
+                min_balance = successful_results['finishing_balance'].min()
+            else:
+                avg_profit = avg_sharpe = avg_balance = min_balance = 0
+            
+            # Normalize metrics for scoring (0-100 scale)
+            # Success rate is already 0-1, multiply by 100
+            norm_success = success_rate * 100
+            
+            # Profit: cap at 1000% and normalize
+            norm_profit = min(avg_profit / 10, 100) if avg_profit > 0 else 0
+            
+            # Sharpe: assume 5.0 is excellent, normalize
+            norm_sharpe = min(avg_sharpe / 5 * 100, 100) if avg_sharpe > 0 else 0
+            
+            # Balance: assume $500k is excellent
+            norm_avg_balance = min(avg_balance / 500000 * 100, 100) if avg_balance > 0 else 0
+            
+            # Min balance: $50k+ gets full score, scale down from there
+            norm_min_balance = min(min_balance / 50000 * 100, 100) if min_balance > 0 else 0
+            
+            # Use custom weights if provided, otherwise defaults
+            if weights is None:
+                weights = {
+                    'success_rate': 0.50,  # CRITICAL: Avoid bankruptcy
+                    'avg_profit': 0.20,
+                    'avg_sharpe': 0.15,
+                    'avg_balance': 0.10,
+                    'min_balance': 0.05
+                }
+            
+            # Calculate weighted composite score
+            composite_score = (
+                norm_success * weights.get('success_rate', 0.30) +
+                norm_profit * weights.get('avg_profit', 0.25) +
+                norm_sharpe * weights.get('avg_sharpe', 0.20) +
+                norm_avg_balance * weights.get('avg_balance', 0.15) +
+                norm_min_balance * weights.get('min_balance', 0.10)
+            )
+            
+            dna_stats.append({
+                'dna': dna_str,
+                'success_rate': success_rate,
+                'avg_profit': avg_profit,
+                'avg_sharpe': avg_sharpe,
+                'avg_balance': avg_balance,
+                'min_balance': min_balance,
+                'composite_score': composite_score
+            })
+        
+        # Sort by composite score
+        dna_stats_df = pd.DataFrame(dna_stats).sort_values('composite_score', ascending=False)
+        
+        # Award wins to top performers
+        win_threshold = 40.0  # Minimum score to be considered a "win"
+        min_success_rate = 0.80  # Minimum 80% success rate to avoid bankruptcy risk
+        
+        # Filter by both score AND success rate
+        winners = dna_stats_df[
+            (dna_stats_df['composite_score'] >= win_threshold) &
+            (dna_stats_df['success_rate'] >= min_success_rate)
+        ]
+        
+        # Alternative: Award top performer if they meet minimum criteria
+        if len(winners) == 0 and len(dna_stats_df) > 0:
+            # Only award if they have decent score AND high success rate
+            top_dna = dna_stats_df.iloc[0]
+            if top_dna['composite_score'] >= 30 and top_dna['success_rate'] >= min_success_rate:
+                winners = dna_stats_df.head(1)
+        
+        stats = {
+            'total_dnas_tested': len(dna_stats),
+            'winners': len(winners),
+            'winner_details': []
+        }
+        
+        for idx, winner in winners.iterrows():
+            # Get DNA hash
+            dna_hash = hashlib.sha256(winner['dna'].encode()).hexdigest()[:16]
+            
+            # Update wins in database
+            cursor.execute("""
+                UPDATE dna_records 
+                SET wins = wins + 1,
+                    win_score = win_score + ?,
+                    last_win_date = CURRENT_TIMESTAMP
+                WHERE dna_hash = ?
+            """, (winner['composite_score'], dna_hash))
+            
+            stats['winner_details'].append({
+                'dna_hash': dna_hash,
+                'composite_score': winner['composite_score'],
+                'metrics': {
+                    'success_rate': winner['success_rate'],
+                    'avg_profit': winner['avg_profit'],
+                    'avg_sharpe': winner['avg_sharpe'],
+                    'avg_balance': winner['avg_balance'],
+                    'min_balance': winner['min_balance']
+                }
+            })
+        
+        conn.commit()
+        
+        # Print summary
+        print(f"\n🏆 WIN AWARDS")
+        print("="*60)
+        print(f"DNAs Tested: {stats['total_dnas_tested']}")
+        print(f"Winners (score >= {win_threshold} AND success >= {min_success_rate:.0%}): {stats['winners']}")
+        print("\nScoring Breakdown:")
+        print("  - 50% Success Rate (avoid bankruptcy)")
+        print("  - 20% Average Profit")
+        print("  - 15% Average Sharpe")
+        print("  - 10% Average Balance")
+        print("  - 5% Minimum Balance")
+        
+        if winners.empty:
+            print("\nNo DNAs achieved winning performance in this test batch.")
+            if len(dna_stats_df) > 0:
+                print("\nAll DNA Scores:")
+                for _, dna in dna_stats_df.iterrows():
+                    dna_hash = hashlib.sha256(dna['dna'].encode()).hexdigest()[:16]
+                    print(f"  ...{dna_hash[-8:]} - Score: {dna['composite_score']:.1f}")
+        else:
+            print("\nTop Performers:")
+            for _, winner in winners.head(3).iterrows():
+                dna_hash = hashlib.sha256(winner['dna'].encode()).hexdigest()[:16]
+                print(f"\n  ...{dna_hash[-8:]} - Score: {winner['composite_score']:.1f}")
+                print(f"    Success: {winner['success_rate']:.0%}, Profit: {winner['avg_profit']:.0f}%")
+                print(f"    Sharpe: {winner['avg_sharpe']:.2f}, Avg Balance: ${winner['avg_balance']:,.0f}")
+        
+        conn.close()
+        return stats
+    
+    def get_leaderboard(self, min_wins: int = 1) -> pd.DataFrame:
+        """
+        Get DNA leaderboard sorted by wins and total win score
+        
+        Args:
+            min_wins: Minimum number of wins to include
+            
+        Returns:
+            DataFrame with DNA leaderboard
+        """
+        conn = sqlite3.connect(self.db_path)
+        
+        query = """
+            SELECT 
+                dna_hash,
+                strategy_name,
+                wins,
+                win_score,
+                win_score / NULLIF(wins, 0) as avg_win_score,
+                last_win_date,
+                sharpe_ratio as original_sharpe,
+                net_profit_percentage as original_profit,
+                symbol,
+                timeframe
+            FROM dna_records
+            WHERE wins >= ?
+            ORDER BY wins DESC, win_score DESC
+        """
+        
+        df = pd.read_sql_query(query, conn, params=[min_wins])
+        conn.close()
+        
+        return df
 
 
 def get_hall_of_fame(db_path: Optional[str] = None) -> HallOfFame:
