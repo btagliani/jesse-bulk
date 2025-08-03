@@ -3,6 +3,7 @@ import warnings
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated", category=UserWarning)
 
 import datetime
+import hashlib
 import logging
 import os
 import pathlib
@@ -12,7 +13,7 @@ import shutil
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import click
 import jesse.helpers as jh
@@ -274,11 +275,322 @@ def bulk(strategy_name: str) -> None:
 
 
 @cli.command()
+@click.argument("strategy_name", required=False)
+@click.option("--top-n", default=10, help="Number of top DNAs to test (default: 10)")
+@click.option("--runs-per-dna", default=5, help="Number of runs per DNA (default: 5)")
+@click.option("--timeframes", multiple=True, help="Additional timeframes to test (e.g., --timeframes 1h --timeframes 4h)")
+@click.option("--export-csv", help="Export hall of fame to CSV file")
+@click.option("--min-sharpe", type=float, help="Minimum Sharpe ratio filter")
+@click.option("--min-profit", type=float, help="Minimum profit percentage filter")
+@click.option("--show-stats", is_flag=True, help="Show hall of fame statistics")
+def hall_of_fame(strategy_name: Optional[str], top_n: int, runs_per_dna: int, 
+                timeframes: Tuple[str], export_csv: Optional[str],
+                min_sharpe: Optional[float], min_profit: Optional[float],
+                show_stats: bool) -> None:
+    """Test the best DNAs from the Hall of Fame across multiple time periods and timeframes"""
+    from .hall_of_fame import get_hall_of_fame
+    
+    validate_cwd()
+    cfg = get_config()
+    
+    # Get hall of fame instance
+    hof = get_hall_of_fame()
+    
+    # Show statistics if requested
+    if show_stats:
+        stats = hof.get_statistics()
+        print("\n🏆 HALL OF FAME STATISTICS")
+        print("="*50)
+        print(f"Total DNAs: {stats['total_dnas']}")
+        
+        if stats['total_dnas'] > 0:
+            print(f"\nStrategies:")
+            for strategy, count in stats['by_strategy'].items():
+                print(f"  - {strategy}: {count} DNAs")
+            
+            avg_metrics = stats['average_metrics']
+            print(f"\nAverage Metrics:")
+            if avg_metrics['sharpe_ratio'] is not None:
+                print(f"  - Sharpe Ratio: {avg_metrics['sharpe_ratio']:.2f}")
+            if avg_metrics['net_profit_percentage'] is not None:
+                print(f"  - Net Profit: {avg_metrics['net_profit_percentage']:.1f}%")
+            if avg_metrics['win_rate'] is not None:
+                print(f"  - Win Rate: {avg_metrics['win_rate']:.1%}")
+            if avg_metrics['max_drawdown'] is not None:
+                print(f"  - Max Drawdown: {avg_metrics['max_drawdown']:.1f}%")
+            
+            print(f"\nTop Performers:")
+            if stats['top_sharpe'] is not None:
+                print(f"  - Best Sharpe: {stats['top_sharpe']:.2f}")
+            if stats['top_profit'] is not None:
+                print(f"  - Best Profit: {stats['top_profit']:.1f}%")
+            print(f"  - Total Tests: {stats['total_tests']}")
+        else:
+            print("\nNo DNAs in Hall of Fame yet. Run 'refine-best' to add top performers.")
+        
+        print("="*50)
+        
+        if not strategy_name and not export_csv:
+            return
+    
+    # Export if requested
+    if export_csv:
+        hof.export_to_csv(export_csv, strategy_name)
+        return
+    
+    # Get best DNAs from hall of fame
+    best_dnas_df = hof.get_best_dnas(
+        strategy_name=strategy_name,
+        limit=top_n,
+        min_trades=20  # Ensure meaningful results
+    )
+    
+    if best_dnas_df.empty:
+        print("No DNAs found in Hall of Fame matching criteria")
+        return
+    
+    # Apply additional filters
+    if min_sharpe:
+        best_dnas_df = best_dnas_df[best_dnas_df['sharpe_ratio'] >= min_sharpe]
+    if min_profit:
+        best_dnas_df = best_dnas_df[best_dnas_df['net_profit_percentage'] >= min_profit]
+    
+    if best_dnas_df.empty:
+        print("No DNAs found after applying filters")
+        return
+    
+    print(f"\n🏆 TESTING TOP {len(best_dnas_df)} HALL OF FAME DNAs")
+    print("="*60)
+    
+    # Show selected DNAs
+    print("\nSelected DNAs:")
+    for idx, row in best_dnas_df.iterrows():
+        print(f"\n#{idx+1} - {row['strategy_name']} ({row['symbol']} {row['timeframe']})")
+        print(f"  - Sharpe: {row['sharpe_ratio']:.2f}")
+        print(f"  - Profit: {row['net_profit_percentage']:.1f}%") 
+        print(f"  - Win Rate: {row['win_rate']:.1%}")
+        print(f"  - Discovered: {row['discovery_date'][:10]}")
+    
+    # Use the first DNA's strategy if not specified
+    if not strategy_name:
+        strategy_name = best_dnas_df.iloc[0]['strategy_name']
+        print(f"\nUsing strategy: {strategy_name}")
+    
+    # Prepare backtests
+    StrategyClass = jh.get_strategy_class(strategy_name)
+    hp_dict = StrategyClass().hyperparameters()
+    
+    # Prepare config
+    config = {
+        "starting_balance": cfg["backtest-data"]["starting_balance"],
+        "fee": cfg["backtest-data"]["fee"],
+        "type": cfg["backtest-data"]["type"],
+        "futures_leverage": cfg["backtest-data"]["futures_leverage"],
+        "futures_leverage_mode": cfg["backtest-data"]["futures_leverage_mode"],
+        "exchange": cfg["backtest-data"]["exchange"],
+        "settlement_currency": cfg["backtest-data"]["settlement_currency"],
+        "warm_up_candles": cfg["backtest-data"]["warm_up_candles"],
+    }
+    
+    # Determine timeframes to test
+    base_timeframes = list(set(best_dnas_df['timeframe'].unique()))
+    test_timeframes = list(set(base_timeframes + list(timeframes)))
+    
+    print(f"\nTimeframes to test: {', '.join(test_timeframes)}")
+    print(f"Runs per DNA per timeframe: {runs_per_dna}")
+    
+    # Generate test combinations
+    mp_args = []
+    for _, dna_row in best_dnas_df.iterrows():
+        dna_str = dna_row['dna']
+        
+        for timeframe in test_timeframes:
+            for run in range(runs_per_dna):
+                # Generate random dates
+                warm_up_days = cfg["backtest-data"]["warm_up_candles"]
+                end_date = cfg["backtest-data"].get("end_date", datetime.now().strftime("%Y-%m-%d"))
+                start_date = get_random_dates_within_timespan(end_date, warm_up_days)
+                
+                # Use the DNA's original symbol
+                symbol = dna_row['symbol']
+                
+                # Prepare extra routes
+                extra_routes = []
+                if len(cfg["backtest-data"]["extra_routes"]) != 0:
+                    for extra_route in cfg["backtest-data"]["extra_routes"].items():
+                        extra_route = extra_route[1]
+                        extra_routes.append({
+                            "exchange": extra_route["exchange"],
+                            "symbol": extra_route["symbol"],
+                            "timeframe": extra_route["timeframe"],
+                        })
+                
+                route = [{
+                    "exchange": cfg["backtest-data"]["exchange"],
+                    "strategy": strategy_name,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                }]
+                
+                key = f'{symbol}-{timeframe}-{start_date}-{end_date}-{dna_str}'
+                mp_args.append((
+                    key,
+                    config,
+                    route,
+                    extra_routes,
+                    start_date,
+                    end_date,
+                    hp_dict,
+                    dna_str,
+                ))
+    
+    # Run all backtests in parallel
+    n_jobs = joblib.cpu_count() if cfg["n_jobs"] == -1 else cfg["n_jobs"]
+    print(f"\nStarting {len(mp_args)} backtests...")
+    parallel = joblib.Parallel(n_jobs, verbose=10, max_nbytes=None)
+    all_results = parallel(
+        joblib.delayed(backtest_with_info_key)(*args) for args in mp_args
+    )
+    
+    # Process results
+    results_df = pd.DataFrame.from_dict(all_results, orient="columns")
+    results_df["dna"] = results_df["key"].apply(lambda x: x.split("-")[-1])
+    results_df["timeframe"] = results_df["key"].apply(lambda x: x.split("-")[2])
+    
+    # Calculate statistics by DNA and timeframe
+    print("\n" + "="*60)
+    print("HALL OF FAME TEST RESULTS")
+    print("="*60)
+    
+    # Group by DNA
+    for dna_str in best_dnas_df['dna']:
+        dna_results = results_df[results_df['dna'] == dna_str]
+        if dna_results.empty:
+            continue
+            
+        original_row = best_dnas_df[best_dnas_df['dna'] == dna_str].iloc[0]
+        dna_hash = hashlib.sha256(dna_str.encode()).hexdigest()[:16]
+        
+        print(f"\n📊 DNA: ...{dna_hash[-8:]}")
+        print(f"   Strategy: {original_row['strategy_name']}")
+        print(f"   Original: {original_row['sharpe_ratio']:.2f} Sharpe, {original_row['net_profit_percentage']:.1f}% profit")
+        
+        # Results by timeframe
+        for tf in sorted(dna_results['timeframe'].unique()):
+            tf_results = dna_results[dna_results['timeframe'] == tf]
+            
+            avg_sharpe = tf_results['sharpe_ratio'].mean() if 'sharpe_ratio' in tf_results and not tf_results.empty else 0
+            avg_profit = tf_results['net_profit_percentage'].mean() if 'net_profit_percentage' in tf_results and not tf_results.empty else 0
+            avg_winrate = tf_results['win_rate'].mean() if 'win_rate' in tf_results and not tf_results.empty else 0
+            
+            # Calculate success rate based on presence of key metrics
+            # Successful runs have 'sharpe_ratio', failed runs might have 'status' or missing values
+            if 'sharpe_ratio' in tf_results.columns:
+                # Count rows where sharpe_ratio is not null (successful runs)
+                successful_runs = tf_results['sharpe_ratio'].notna().sum()
+                total_runs = len(tf_results)
+                success_rate = (successful_runs / total_runs * 100) if total_runs > 0 else 0
+            else:
+                success_rate = 0  # All failed if no sharpe_ratio column
+            
+            print(f"\n   {tf} timeframe ({len(tf_results)} runs):")
+            print(f"     - Success Rate: {success_rate:.0f}%")
+            print(f"     - Avg Sharpe: {avg_sharpe:.2f}")
+            print(f"     - Avg Profit: {avg_profit:.1f}%")
+            print(f"     - Avg Win Rate: {avg_winrate:.1%}")
+            
+            # Store performance history
+            for _, result in tf_results.iterrows():
+                if 'status' in result and result.get('status') == 'success':
+                    test_conditions = {
+                        'symbol': result['key'].split('-')[0] + '-' + result['key'].split('-')[1],
+                        'timeframe': tf,
+                        'start_date': result['key'].split('-')[3],
+                        'end_date': result['key'].split('-')[4],
+                    }
+                    
+                    hof.add_performance_test(
+                        dna_hash=dna_hash,
+                        test_results=result.to_dict(),
+                        test_conditions=test_conditions,
+                        test_type='hall_of_fame_test'
+                    )
+    
+    # Save detailed results
+    dt = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+    results_df.to_csv(
+        f"hall_of_fame_test_{dt}.csv", encoding="utf-8", sep="\t"
+    )
+    
+    print(f"\n💾 Detailed results saved to: hall_of_fame_test_{dt}.csv")
+    print(f"📊 Performance history updated in Hall of Fame database")
+
+
+@cli.command()
+def presets() -> None:
+    """Show available selection presets and their descriptions"""
+    from .selection import SELECTION_PRESETS
+    
+    print("Available Selection Presets:")
+    print("="*50)
+    
+    preset_descriptions = {
+        'conservative': {
+            'description': 'Focuses on risk-adjusted returns and consistent performance',
+            'targets': 'High Sharpe ratio, good win rate, low drawdown',
+            'best_for': 'Risk-averse traders who prioritize capital preservation'
+        },
+        'aggressive': {
+            'description': 'Targets maximum profit potential and high expectancy',
+            'targets': 'High net profit, strong expectancy, good win/loss ratio',
+            'best_for': 'Profit-focused traders willing to accept higher risk'
+        },
+        'balanced': {
+            'description': 'Balances profit, risk, and consistency with diversity',
+            'targets': 'Multiple metrics with parameter diversity',
+            'best_for': 'Most traders seeking well-rounded strategies'
+        },
+        'robust': {
+            'description': 'Uses Pareto optimization for multi-objective selection',
+            'targets': 'Training vs testing performance balance',
+            'best_for': 'Advanced users wanting non-dominated solutions'
+        }
+    }
+    
+    for preset_name, config in SELECTION_PRESETS.items():
+        desc = preset_descriptions.get(preset_name, {})
+        print(f"\n🎯 {preset_name.upper()}")
+        print(f"   Description: {desc.get('description', 'No description available')}")
+        print(f"   Targets: {desc.get('targets', 'N/A')}")
+        print(f"   Best for: {desc.get('best_for', 'N/A')}")
+        
+        print(f"   Metrics ({len(config['metrics'])}):")
+        for metric in config['metrics']:
+            weight_pct = metric['weight'] * 100
+            thresholds = []
+            if metric.get('min_threshold'):
+                thresholds.append(f"min≥{metric['min_threshold']}")
+            if metric.get('max_threshold'):
+                thresholds.append(f"max≤{metric['max_threshold']}")
+            threshold_str = f" ({', '.join(thresholds)})" if thresholds else ""
+            
+            print(f"     - {metric['metric']}: {weight_pct:.0f}%{threshold_str}")
+    
+    print(f"\n💡 Usage Examples:")
+    print(f"   jesse-bulk refine-best study.db --selection-preset conservative")
+    print(f"   jesse-bulk refine-best study.db --selection-preset aggressive --top-n 10")
+
+
+@cli.command()
 @click.argument("db_path", required=True, type=str)
 @click.option("--top-n", default=10, help="Number of top DNAs to test (default: 10)")
 @click.option("--runs-per-dna", default=10, help="Number of runs per DNA (default: 10)")
-def refine_best(db_path: str, top_n: int, runs_per_dna: int) -> None:
+@click.option("--selection-preset", type=click.Choice(['conservative', 'aggressive', 'balanced', 'robust']), 
+              help="Use a preset selection strategy")
+@click.option("--all-presets", is_flag=True, help="Test all selection presets and find the ultimate king DNA")
+def refine_best(db_path: str, top_n: int, runs_per_dna: int, selection_preset: Optional[str] = None, all_presets: bool = False) -> None:
     from .optuna_reader import read_optuna_study, find_optuna_databases
+    from .selection import SelectionEngine, SELECTION_PRESETS
     
     validate_cwd()
     cfg = get_config()
@@ -297,19 +609,186 @@ def refine_best(db_path: str, top_n: int, runs_per_dna: int) -> None:
     study_name = cfg.get('optuna_study_name', None)
     dna_df = read_optuna_study(db_path, study_name)
     
-    # Get top N DNAs based on the sort criteria from config
-    sort_criteria = cfg.get('sort_by', 'training_log.net_profit_percentage')
+    # Use advanced selection if configured, otherwise fall back to simple selection
+    selection_config = cfg.get('selection_strategy', None)
     
-    # Sort and get top N (use full column name as specified in config)
-    if sort_criteria in dna_df.columns:
-        top_dnas = dna_df.nlargest(top_n, sort_criteria)
-        print(f"Sorted by: {sort_criteria}")
+    # Store both selection results for comparison
+    advanced_dnas = None
+    simple_dnas = None
+    
+    # Handle --all-presets flag
+    if all_presets:
+        print("\n" + "="*60)
+        print("🏆 TESTING ALL SELECTION PRESETS")
+        print("="*60)
+        print(f"\nWill test {len(SELECTION_PRESETS)} presets to find the ultimate king DNA")
+        
+        all_preset_results = {}
+        all_preset_dnas = {}
+        
+        # Run each preset
+        for preset_name in SELECTION_PRESETS:
+            print(f"\n{'='*60}")
+            print(f"Testing preset: {preset_name.upper()}")
+            print(f"{'='*60}")
+            
+            selection_config = SELECTION_PRESETS[preset_name]
+            engine = SelectionEngine(selection_config)
+            preset_dnas = engine.select(dna_df, top_n)
+            
+            # Store selected DNAs
+            all_preset_dnas[preset_name] = preset_dnas
+            
+            # Print selection stats
+            report = engine.get_selection_report(dna_df, preset_dnas)
+            print(f"\nSelected {len(preset_dnas)} DNAs")
+            if 'metric_stats' in report:
+                for metric, stats in report['metric_stats'].items():
+                    print(f"  - {metric}: {stats['min']:.2f} to {stats['max']:.2f} (avg: {stats['mean']:.2f})")
+        
+        # Combine all unique DNAs from all presets and track their origin
+        for preset_name, preset_dnas in all_preset_dnas.items():
+            preset_dnas['preset_origin'] = preset_name
+        
+        all_unique_dnas = pd.concat(all_preset_dnas.values())
+        # Keep track of which presets selected each DNA
+        dna_preset_map = all_unique_dnas.groupby('dna')['preset_origin'].apply(list).to_dict()
+        all_unique_dnas = all_unique_dnas.drop_duplicates(subset=['dna'])
+        
+        print(f"\n{'='*60}")
+        print(f"Total unique DNAs across all presets: {len(all_unique_dnas)}")
+        
+        # Show overlap between presets
+        dna_counts = {}
+        for dna, presets in dna_preset_map.items():
+            count = len(presets)
+            if count not in dna_counts:
+                dna_counts[count] = 0
+            dna_counts[count] += 1
+        
+        print("\nDNA selection overlap:")
+        for count, num_dnas in sorted(dna_counts.items(), reverse=True):
+            if count > 1:
+                print(f"  - {num_dnas} DNAs selected by {count} presets")
+            else:
+                print(f"  - {num_dnas} DNAs selected by only 1 preset")
+        print(f"{'='*60}")
+        
+        # Use combined DNAs for testing
+        top_dnas = all_unique_dnas
+        
+    # Override with preset if specified
+    elif selection_preset:
+        selection_config = SELECTION_PRESETS[selection_preset]
+        print(f"Using '{selection_preset}' selection preset")
+        
+        # Always run both selections for comparison when using preset
+        print("\n" + "="*60)
+        print("ADVANCED MULTI-CRITERIA SELECTION")
+        print("="*60)
+        engine = SelectionEngine(selection_config)
+        advanced_dnas = engine.select(dna_df, top_n)
+        
+        # Print selection report
+        report = engine.get_selection_report(dna_df, advanced_dnas)
+        print(f"\nSelection Report:")
+        print(f"  - Total candidates: {report['total_candidates']}")
+        print(f"  - Selected: {report['total_selected']}")
+        print(f"  - Metrics used: {', '.join(report['metrics_used'])}")
+        
+        if 'metric_stats' in report:
+            print("\nSelected DNA statistics:")
+            for metric, stats in report['metric_stats'].items():
+                print(f"  - {metric}: {stats['min']:.2f} to {stats['max']:.2f} (avg: {stats['mean']:.2f})")
+        
+        # Also run simple selection for comparison
+        print("\n" + "="*60)
+        print("SIMPLE SELECTION (for comparison)")
+        print("="*60)
+        sort_criteria = cfg.get('sort_by', 'training_log.net_profit_percentage')
+        
+        if sort_criteria in dna_df.columns:
+            simple_dnas = dna_df.nlargest(top_n, sort_criteria)
+            print(f"Sorted by: {sort_criteria}")
+            
+            # Show simple selection statistics
+            if sort_criteria in simple_dnas.columns:
+                print(f"\nSimple selection {sort_criteria} stats:")
+                print(f"  - Range: {simple_dnas[sort_criteria].min():.2f} to {simple_dnas[sort_criteria].max():.2f}")
+                print(f"  - Average: {simple_dnas[sort_criteria].mean():.2f}")
+        
+        # Compare the selections
+        print("\n" + "="*60)
+        print("HEAD-TO-HEAD COMPARISON")
+        print("="*60)
+        
+        # Find overlapping DNAs
+        advanced_set = set(advanced_dnas['dna'])
+        simple_set = set(simple_dnas['dna'])
+        overlap = advanced_set.intersection(simple_set)
+        
+        print(f"\nDNA Selection Overlap:")
+        print(f"  - Advanced selection: {len(advanced_dnas)} unique DNAs")
+        print(f"  - Simple selection: {len(simple_dnas)} unique DNAs")
+        print(f"  - Overlap: {len(overlap)} DNAs ({len(overlap)/len(advanced_dnas)*100:.1f}% of advanced)")
+        
+        # Compare key metrics
+        comparison_metrics = ['training_log.sharpe_ratio', 'training_log.net_profit_percentage', 
+                            'training_log.win_rate', 'training_log.max_drawdown']
+        
+        print("\nAverage Metrics Comparison:")
+        print(f"{'Metric':<35} {'Advanced':>12} {'Simple':>12} {'Difference':>12}")
+        print("-" * 72)
+        
+        for metric in comparison_metrics:
+            if metric in advanced_dnas.columns and metric in simple_dnas.columns:
+                adv_avg = advanced_dnas[metric].mean()
+                simple_avg = simple_dnas[metric].mean()
+                diff = adv_avg - simple_avg
+                diff_pct = (diff / abs(simple_avg) * 100) if simple_avg != 0 else 0
+                
+                # Format based on metric type
+                if 'percentage' in metric or 'rate' in metric:
+                    print(f"{metric:<35} {adv_avg:>11.2f}% {simple_avg:>11.2f}% {diff_pct:>11.1f}%")
+                else:
+                    print(f"{metric:<35} {adv_avg:>12.2f} {simple_avg:>12.2f} {diff_pct:>11.1f}%")
+        
+        # Use advanced selection for actual testing
+        top_dnas = advanced_dnas
+        print(f"\n{'='*60}")
+        print(f"Using ADVANCED selection results for backtesting")
+        print(f"{'='*60}")
+        
+    elif selection_config:
+        # Use advanced selection engine without comparison
+        print("Using advanced multi-criteria selection")
+        engine = SelectionEngine(selection_config)
+        top_dnas = engine.select(dna_df, top_n)
+        
+        # Print selection report
+        report = engine.get_selection_report(dna_df, top_dnas)
+        print(f"\nSelection Report:")
+        print(f"  - Total candidates: {report['total_candidates']}")
+        print(f"  - Selected: {report['total_selected']}")
+        print(f"  - Metrics used: {', '.join(report['metrics_used'])}")
+        
+        if 'metric_stats' in report:
+            print("\nSelected DNA statistics:")
+            for metric, stats in report['metric_stats'].items():
+                print(f"  - {metric}: {stats['min']:.2f} to {stats['max']:.2f} (avg: {stats['mean']:.2f})")
     else:
-        print(f"Warning: Sort column '{sort_criteria}' not found in database.")
-        print(f"Available columns include: {[col for col in dna_df.columns if 'net_profit_percentage' in col]}")
-        top_dnas = dna_df.head(top_n)
+        # Fall back to simple selection
+        sort_criteria = cfg.get('sort_by', 'training_log.net_profit_percentage')
+        
+        if sort_criteria in dna_df.columns:
+            top_dnas = dna_df.nlargest(top_n, sort_criteria)
+            print(f"Simple selection sorted by: {sort_criteria}")
+        else:
+            print(f"Warning: Sort column '{sort_criteria}' not found in database.")
+            print(f"Available columns include: {[col for col in dna_df.columns if 'net_profit_percentage' in col]}")
+            top_dnas = dna_df.head(top_n)
     
-    print(f"Selected top {len(top_dnas)} DNAs for refinement")
+    print(f"\nSelected {len(top_dnas)} DNAs for refinement")
 
     StrategyClass = jh.get_strategy_class(strategy_name)
     hp_dict = StrategyClass().hyperparameters()
@@ -401,6 +880,148 @@ def refine_best(db_path: str, top_n: int, runs_per_dna: int) -> None:
     print(
         f"The best performing DNA is: {best_dna.name} with an average finishing balance of {best_dna['finishing_balance']:.2f}%"
     )
+    
+    # If using --all-presets, show which preset found the king DNA
+    if all_presets:
+        print("\n" + "="*60)
+        print("🏆 PRESET PERFORMANCE ANALYSIS")
+        print("="*60)
+        
+        # Map DNAs back to their presets
+        preset_performance = {}
+        for dna_str in sorted_results.index:
+            if dna_str in dna_preset_map:
+                for preset in dna_preset_map[dna_str]:
+                    if preset not in preset_performance:
+                        preset_performance[preset] = []
+                    preset_performance[preset].append({
+                        'dna': dna_str,
+                        'finishing_balance': sorted_results.loc[dna_str, 'finishing_balance'],
+                        'sharpe_ratio': sorted_results.loc[dna_str, 'sharpe_ratio'] if 'sharpe_ratio' in sorted_results else 0,
+                        'win_rate': sorted_results.loc[dna_str, 'win_rate'] if 'win_rate' in sorted_results else 0
+                    })
+        
+        # Analyze each preset's performance
+        preset_stats = {}
+        for preset, dnas in preset_performance.items():
+            if dnas:
+                avg_balance = np.mean([d['finishing_balance'] for d in dnas])
+                max_balance = max([d['finishing_balance'] for d in dnas])
+                avg_sharpe = np.mean([d['sharpe_ratio'] for d in dnas])
+                preset_stats[preset] = {
+                    'avg_finishing_balance': avg_balance,
+                    'max_finishing_balance': max_balance,
+                    'avg_sharpe': avg_sharpe,
+                    'dna_count': len(dnas),
+                    'best_dna': max(dnas, key=lambda x: x['finishing_balance'])
+                }
+        
+        # Sort presets by average performance
+        sorted_presets = sorted(preset_stats.items(), key=lambda x: x[1]['avg_finishing_balance'], reverse=True)
+        
+        print("\nPreset Rankings (by average finishing balance):")
+        for i, (preset, stats) in enumerate(sorted_presets, 1):
+            print(f"\n{i}. {preset.upper()}")
+            print(f"   - DNAs tested: {stats['dna_count']}")
+            print(f"   - Avg finishing balance: {stats['avg_finishing_balance']:.2f}%")
+            print(f"   - Best finishing balance: {stats['max_finishing_balance']:.2f}%")
+            print(f"   - Avg Sharpe ratio: {stats['avg_sharpe']:.2f}")
+        
+        # Find which preset(s) selected the overall king DNA
+        king_dna = best_dna.name
+        king_presets = dna_preset_map.get(king_dna, [])
+        
+        print("\n" + "-"*60)
+        print(f"👑 THE KING DNA was selected by: {', '.join([p.upper() for p in king_presets])}")
+        print(f"   DNA: {king_dna[:20]}...")
+        print(f"   Finishing Balance: {best_dna['finishing_balance']:.2f}%")
+        if 'sharpe_ratio' in best_dna:
+            print(f"   Sharpe Ratio: {best_dna['sharpe_ratio']:.2f}")
+        if 'win_rate' in best_dna:
+            print(f"   Win Rate: {best_dna['win_rate']:.2%}")
+        print("-"*60)
+    
+    # Add top performers to Hall of Fame
+    from .hall_of_fame import get_hall_of_fame
+    hall_of_fame = get_hall_of_fame()
+    
+    print("\n" + "="*60)
+    print("ADDING TOP PERFORMERS TO HALL OF FAME")
+    print("="*60)
+    
+    # Get detailed results for each DNA
+    for dna_str in sorted_results.head(3).index:  # Top 3 DNAs
+        # Get all results for this DNA
+        dna_results = results_df[results_df['dna'] == dna_str]
+        
+        # Calculate aggregate metrics
+        def safe_mean(series, convert_int=False):
+            try:
+                # Filter out non-numeric values
+                numeric_series = pd.to_numeric(series, errors='coerce')
+                if numeric_series.notna().any():
+                    mean_val = numeric_series.mean()
+                    return int(mean_val) if convert_int and pd.notna(mean_val) else mean_val
+            except:
+                pass
+            return None
+            
+        metrics = {
+            'sharpe_ratio': safe_mean(dna_results.get('sharpe_ratio')),
+            'net_profit_percentage': safe_mean(dna_results.get('net_profit_percentage')),
+            'win_rate': safe_mean(dna_results.get('win_rate')),
+            'max_drawdown': safe_mean(dna_results.get('max_drawdown')),
+            'total': safe_mean(dna_results.get('total'), convert_int=True),
+            'expectancy_percentage': safe_mean(dna_results.get('expectancy_percentage')),
+            'ratio_avg_win_loss': safe_mean(dna_results.get('ratio_avg_win_loss')),
+            'calmar_ratio': safe_mean(dna_results.get('calmar_ratio')),
+            'sortino_ratio': safe_mean(dna_results.get('sortino_ratio')),
+            'omega_ratio': safe_mean(dna_results.get('omega_ratio')),
+            'finishing_balance': safe_mean(dna_results.get('finishing_balance')),
+        }
+        
+        # Get test conditions from the first result
+        first_result_key = dna_results.iloc[0]['key']
+        key_parts = first_result_key.split('-')
+        
+        test_conditions = {
+            'symbol': key_parts[0] + '-' + key_parts[1],  # e.g., BTC-USDT
+            'timeframe': key_parts[2],
+            'start_date': key_parts[3],
+            'end_date': key_parts[4],
+        }
+        
+        try:
+            record_id = hall_of_fame.add_dna(
+                dna=dna_str,
+                metrics=metrics,
+                strategy_name=strategy_name,
+                test_conditions=test_conditions,
+                source='refine-best',
+                selection_method=selection_preset if selection_preset else 'custom',
+                notes=f"Avg of {len(dna_results)} runs"
+            )
+            
+            print(f"✅ Added DNA to Hall of Fame (ID: {record_id})")
+            print(f"   - Sharpe: {metrics.get('sharpe_ratio', 0):.2f}")
+            print(f"   - Profit: {metrics.get('net_profit_percentage', 0):.2f}%")
+            print(f"   - Win Rate: {metrics.get('win_rate', 0):.2%}")
+            
+        except Exception as e:
+            print(f"❌ Failed to add DNA to Hall of Fame: {e}")
+    
+    # Show Hall of Fame statistics
+    stats = hall_of_fame.get_statistics()
+    print(f"\n📊 Hall of Fame Statistics:")
+    print(f"   - Total DNAs: {stats['total_dnas']}")
+    if stats['total_dnas'] > 0:
+        print(f"   - Strategies: {', '.join(f'{k}({v})' for k, v in stats['by_strategy'].items())}")
+        if stats['average_metrics']['sharpe_ratio'] is not None:
+            print(f"   - Avg Sharpe: {stats['average_metrics']['sharpe_ratio']:.2f}")
+        if stats['top_sharpe'] is not None:
+            print(f"   - Top Sharpe: {stats['top_sharpe']:.2f}")
+        if stats['top_profit'] is not None:
+            print(f"   - Top Profit: {stats['top_profit']:.2f}%")
 
 
 def get_random_dates_within_timespan(end_date: str, warm_up_days: int) -> str:

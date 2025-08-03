@@ -9,7 +9,8 @@ REQUIRED_PACKAGES = [
     'pyyaml',
     'joblib',
     'psutil',
-    'optuna'
+    'optuna',
+    'scikit-learn>=1.0.0'
 ]
 
 with open("README.md", "r", encoding="utf-8") as f:
