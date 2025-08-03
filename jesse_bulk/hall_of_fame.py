@@ -196,6 +196,12 @@ class HallOfFame:
         else:
             backtest_days = None
         
+        # Check if DNA already exists
+        existing = cursor.execute(
+            "SELECT id FROM dna_records WHERE dna_hash = ? AND strategy_name = ? AND symbol = ? AND timeframe = ?",
+            (dna_hash, strategy_name, test_conditions.get('symbol'), test_conditions.get('timeframe'))
+        ).fetchone()
+        
         try:
             cursor.execute("""
                 INSERT OR REPLACE INTO dna_records (
@@ -254,7 +260,13 @@ class HallOfFame:
             ))
             
             conn.commit()
-            return record_id
+            
+            # Return ID and whether it was new or updated
+            return {
+                'id': record_id,
+                'is_new': existing is None,
+                'action': 'added' if existing is None else 'updated'
+            }
             
         except sqlite3.IntegrityError:
             # DNA already exists, update if better performance

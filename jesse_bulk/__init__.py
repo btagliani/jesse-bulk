@@ -1007,10 +1007,11 @@ def refine_best(db_path: str, top_n: int, runs_per_dna: int, selection_preset: O
         # Find which preset(s) selected the overall king DNA
         king_dna = best_dna.name
         king_presets = dna_preset_map.get(king_dna, [])
+        king_hash = hashlib.sha256(king_dna.encode()).hexdigest()[:16]
         
         print("\n" + "-"*60)
         print(f"👑 THE KING DNA was selected by: {', '.join([p.upper() for p in king_presets])}")
-        print(f"   DNA: {king_dna[:20]}...")
+        print(f"   DNA: ...{king_hash[-8:]}")
         print(f"   Finishing Balance: {best_dna['finishing_balance']:.2f}%")
         if 'sharpe_ratio' in best_dna:
             print(f"   Sharpe Ratio: {best_dna['sharpe_ratio']:.2f}")
@@ -1069,7 +1070,7 @@ def refine_best(db_path: str, top_n: int, runs_per_dna: int, selection_preset: O
         }
         
         try:
-            record_id = hall_of_fame.add_dna(
+            result = hall_of_fame.add_dna(
                 dna=dna_str,
                 metrics=metrics,
                 strategy_name=strategy_name,
@@ -1079,7 +1080,11 @@ def refine_best(db_path: str, top_n: int, runs_per_dna: int, selection_preset: O
                 notes=f"Avg of {len(dna_results)} runs"
             )
             
-            print(f"✅ Added DNA to Hall of Fame (ID: {record_id})")
+            dna_hash = hashlib.sha256(dna_str.encode()).hexdigest()[:16]
+            if result['is_new']:
+                print(f"✅ Added NEW DNA to Hall of Fame: ...{dna_hash[-8:]}")
+            else:
+                print(f"✅ Updated existing DNA in Hall of Fame: ...{dna_hash[-8:]}")
             print(f"   - Sharpe: {metrics.get('sharpe_ratio', 0):.2f}")
             print(f"   - Profit: {metrics.get('net_profit_percentage', 0):.2f}%")
             print(f"   - Win Rate: {metrics.get('win_rate', 0):.2%}")
