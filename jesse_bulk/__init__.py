@@ -571,6 +571,27 @@ def hall_of_fame(strategy_name: Optional[str], top_n: int, runs_per_dna: int,
 
 
 @cli.command()
+@click.option("--reset", is_flag=True, help="Reset all wins to zero")
+@click.option("--confirm", is_flag=True, help="Confirm reset action")
+def reset_leaderboard(reset: bool, confirm: bool) -> None:
+    """Reset the Hall of Fame leaderboard wins"""
+    from .hall_of_fame import get_hall_of_fame
+    
+    if not reset:
+        print("Use --reset flag to reset the leaderboard wins")
+        return
+    
+    if not confirm:
+        print("⚠️  This will reset ALL wins to zero!")
+        print("Use --reset --confirm to proceed")
+        return
+    
+    hof = get_hall_of_fame()
+    hof.reset_wins()
+    print("✅ Leaderboard has been reset - all wins set to zero")
+
+
+@cli.command()
 @click.option("--min-wins", type=int, default=1, help="Minimum wins to show (default: 1)")
 def leaderboard(min_wins: int) -> None:
     """Show Hall of Fame leaderboard sorted by wins"""

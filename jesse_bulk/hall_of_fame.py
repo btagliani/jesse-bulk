@@ -840,6 +840,24 @@ class HallOfFame:
         conn.close()
         
         return df
+    
+    def reset_wins(self) -> None:
+        """Reset all wins and win scores to zero"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            UPDATE dna_records 
+            SET wins = 0, 
+                win_score = 0.0, 
+                last_win_date = NULL
+        """)
+        
+        affected = cursor.rowcount
+        conn.commit()
+        conn.close()
+        
+        print(f"Reset wins for {affected} DNAs")
 
 
 def get_hall_of_fame(db_path: Optional[str] = None) -> HallOfFame:
